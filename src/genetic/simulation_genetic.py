@@ -35,6 +35,11 @@ class GAConfig:
     resume_path: Optional[str] = None
     # Fitness shaping
     circle_weight: float = 0.0  # weight for circle uniformity term
+    name : str = "ga_gen"
+    # Image/emoji target for shape-based fitness
+    image: Optional[str] = None
+    emoji: Optional[str] = "🐣"
+    N_times : int = 1  # Number of times to evaluate each model and average fitness
 
 
 class ParticleWorld:
@@ -88,28 +93,6 @@ class ParticleWorld:
         self._perform_divisions(divide)
 
 
-def circle_uniformity_penalty(x: torch.Tensor) -> float:
-    if x.shape[0] <= 1:
-        return 0.0
-    radii = torch.sqrt(torch.clamp((x ** 2).sum(dim=-1), min=1e-12))
-    radius_std = torch.std(radii).item()
-    return radius_std
-
-def evaluate_model(cfg: GAConfig, model: ParticleNCA) -> float:
-    world = ParticleWorld(cfg, model)
-    world.reset(n0=1)
-    for _ in range(cfg.rollout_steps):
-        world.step()
-    # Fitness: negative squared distance from target count (higher is better)
-    curr = world.x.shape[0]
-    fitness = -((curr - cfg.target_count) ** 2)
-    # Optional circle uniformity: penalize variance in radii from origin
-    # if cfg.circle_weight > 0.0 and world.x is not None and world.x.shape[0] > 1:
-    #     penalty = circle_uniformity_penalty(world.x)
-    #     fitness -= cfg.circle_weight * penalty
-    # fitness = (curr - cfg.target_count)**2
-    return float(fitness)
-
 
 def clone_model(model: ParticleNCA) -> ParticleNCA:
     clone = ParticleNCA(
@@ -142,7 +125,7 @@ def crossover_models(parent_a: ParticleNCA, parent_b: ParticleNCA, frac: float) 
 
 def _save_checkpoint(cfg: GAConfig, generation: int, population: List[ParticleNCA], history: List[float]):
     os.makedirs(cfg.checkpoint_dir, exist_ok=True)
-    ckpt_path = os.path.join(cfg.checkpoint_dir, f"ga_gen_{generation}.pt")
+    ckpt_path = os.path.join(cfg.checkpoint_dir, f"{cfg.name}_{generation}.pt")
     state = {
         "generation": generation,
         "history": history,
@@ -183,6 +166,28 @@ def _load_checkpoint(cfg: GAConfig) -> Tuple[int, List[ParticleNCA], List[float]
     return start_gen, population, history
 
 
+from target_functions import correct_cell_count_fitness, looks_like_image_fitness
+
+# Select fitness function: use emoji/image-based shape matching if configured
+def fitness_fn(world, cfg):
+    if cfg.image is not None or cfg.emoji is not None:
+        return looks_like_image_fitness(world, cfg, image=cfg.image, emoji=cfg.emoji)
+    return correct_cell_count_fitness(world, cfg)
+
+def evaluate_model(cfg: GAConfig, model: ParticleNCA, N_times : int= 1) -> float:
+  world = ParticleWorld(cfg, model)
+  world.reset(n0=1)
+
+  fitness = 0.0
+  for iii in range(cfg.rollout_steps):
+    world.step()
+    if (iii+1) % (cfg.rollout_steps // N_times) == 0:
+        fitness += fitness_fn(world, cfg)
+
+    fitness /= N_times
+  # Fitness: negative squared distance from target count (higher is better)
+  return float(fitness)
+
 def genetic_train(cfg: GAConfig) -> Tuple[ParticleNCA, List[float]]:
     # Initialize or resume population
     if cfg.resume_path:
@@ -206,7 +211,7 @@ def genetic_train(cfg: GAConfig) -> Tuple[ParticleNCA, List[float]]:
 
     for g in range(start_gen, cfg.generations):
         # Evaluate population
-        scores = [evaluate_model(cfg, m) for m in population]
+        scores = [evaluate_model(cfg, m, N_times=cfg.N_times) for m in population]
         history.append(max(scores))
 
         # Select elites
@@ -226,7 +231,9 @@ def genetic_train(cfg: GAConfig) -> Tuple[ParticleNCA, List[float]]:
         population = new_pop
 
         best = ranked[0][0]
-        print(f"Gen {g+1}/{cfg.generations} | best_fitness={best:.2f}")
+        worst = ranked[-1][0]
+        median_elite = ranked[elite_k // 2][0]
+        print(f"Gen {g+1}/{cfg.generations} | best_fitness={best:.2f} | worst_fitness={worst:.2f} | median_elite_fitness={median_elite:.2f}")
 
         # Save checkpoint every 5 generations
         if (g + 1) % 5 == 0:
