@@ -17,7 +17,7 @@ def main():
         max_cells=1000,
         circle_weight=2.0,
         device="cpu",
-        resume_path=None,  # or None to train from scratch
+        resume_path="checkpoints/genetic_emoji_15.pt",  # or None to train from scratch
         name = "genetic_emoji",
         emoji="🦎",
         N_times = 2,
