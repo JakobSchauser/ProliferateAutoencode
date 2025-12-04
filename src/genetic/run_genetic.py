@@ -11,16 +11,16 @@ def main():
         mutation_std=0.05,
         crossover_frac=0.5,
         generations=100,
-        rollout_steps=200,
+        rollout_steps=500,
         dt=0.1,
         target_count=99,
         max_cells=1000,
         circle_weight=2.0,
         device="cpu",
-        resume_path="checkpoints/genetic_emoji_15.pt",  # or None to train from scratch
-        name = "genetic_emoji",
+        resume_path=None,  # or None to train from scratch
+        name = "genetic_emoji_server",
         emoji="🦎",
-        N_times = 2,
+        N_times = 3,
 
     )
     best_model, hist = genetic_train(cfg)
