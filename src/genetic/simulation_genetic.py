@@ -2,6 +2,7 @@ import math
 import random
 from dataclasses import dataclass
 from typing import Callable, List, Optional, Tuple
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import torch
 
@@ -166,12 +167,12 @@ def _load_checkpoint(cfg: GAConfig) -> Tuple[int, List[ParticleNCA], List[float]
     return start_gen, population, history
 
 
-from target_functions import correct_cell_count_fitness, looks_like_image_fitness
+from target_functions import correct_cell_count_fitness, looks_like_image_fitness, separation_fitness
 
 # Select fitness function: use emoji/image-based shape matching if configured
 def fitness_fn(world, cfg):
     if cfg.image is not None or cfg.emoji is not None:
-        return looks_like_image_fitness(world, cfg, image=cfg.image, emoji=cfg.emoji)
+        return looks_like_image_fitness(world, cfg, image=cfg.image, emoji=cfg.emoji) + separation_fitness(world, cfg)*0.1
     return correct_cell_count_fitness(world, cfg)
 
 def evaluate_model(cfg: GAConfig, model: ParticleNCA, N_times : int= 1) -> float:
@@ -210,8 +211,18 @@ def genetic_train(cfg: GAConfig) -> Tuple[ParticleNCA, List[float]]:
     elite_k = max(1, int(cfg.elite_frac * cfg.population_size))
 
     for g in range(start_gen, cfg.generations):
-        # Evaluate population
-        scores = [evaluate_model(cfg, m, N_times=cfg.N_times) for m in population]
+        # Evaluate population (threaded)
+        scores: List[float] = [float('-inf')] * len(population)
+        max_workers = min(16, len(population))
+        with ThreadPoolExecutor(max_workers=max_workers) as ex:
+            future_to_idx = {ex.submit(evaluate_model, cfg, m, cfg.N_times): i for i, m in enumerate(population)}
+            for fut in as_completed(future_to_idx):
+                i = future_to_idx[fut]
+                try:
+                    scores[i] = float(fut.result())
+                except Exception as e:
+                    scores[i] = float('-inf')
+                    print(f"[Warn] Evaluation failed at gen {g}, individual {i}: {e}")
         history.append(max(scores))
 
         # Select elites
@@ -219,9 +230,33 @@ def genetic_train(cfg: GAConfig) -> Tuple[ParticleNCA, List[float]]:
         elites = [clone_model(m) for _, m in ranked[:elite_k]]
 
         # Reproduce
+        # Order: elites, 3 random, mutated elites (1 per elite), then fill with elite crossovers
         new_pop: List[ParticleNCA] = elites.copy()
+
+        # Add up to 3 fresh random individuals each generation
+        for _ in range(3):
+            if len(new_pop) >= cfg.population_size:
+                break
+            m_rand = ParticleNCA(
+                molecule_dim=cfg.n_molecules,
+                k=cfg.k,
+                cutoff=cfg.cutoff,
+                angle_sin_cos=cfg.angle_sin_cos,
+                positional_encoding=cfg.positional_encoding,
+                aggregate=cfg.aggregate,
+            )
+            new_pop.append(m_rand)
+
+        # Each elite gets one direct mutated descendant
+        for e in elites:
+            if len(new_pop) >= cfg.population_size:
+                break
+            child = clone_model(e)
+            mutate_model(child, cfg.mutation_std)
+            new_pop.append(child)
+
+        # Fill the remaining slots with crossover children from elites, then mutate
         while len(new_pop) < cfg.population_size:
-            # Pick two parents from elites
             a = random.choice(elites)
             b = random.choice(elites)
             child = crossover_models(a, b, cfg.crossover_frac)
@@ -235,8 +270,8 @@ def genetic_train(cfg: GAConfig) -> Tuple[ParticleNCA, List[float]]:
         median_elite = ranked[elite_k // 2][0]
         print(f"Gen {g+1}/{cfg.generations} | best_fitness={best:.2f} | worst_fitness={worst:.2f} | median_elite_fitness={median_elite:.2f}")
 
-        # Save checkpoint every 5 generations
-        if (g + 1) % 5 == 0:
+        # Save checkpoint every 10 generations
+        if (g + 1) % 50 == 0:
             _save_checkpoint(cfg, g + 1, population, history)
 
     # Return best individual

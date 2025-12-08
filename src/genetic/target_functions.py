@@ -8,7 +8,7 @@ import torch
 
 
 
-def load_image(url, max_size=256/2):
+def load_image(url, max_size=256/8):
   r = requests.get(url)
   img = PIL.Image.open(io.BytesIO(r.content))
   img.thumbnail((max_size, max_size), PIL.Image.Resampling.LANCZOS)
@@ -21,7 +21,19 @@ def load_image(url, max_size=256/2):
 def load_emoji(emoji):
   code = hex(ord(emoji))[2:].lower()
   url = 'https://github.com/googlefonts/noto-emoji/blob/main/png/128/emoji_u%s.png?raw=true'%code
-  return load_image(url)
+
+  # return load_image(url)
+
+  # for testing
+  localpath = "2.png"
+  if os.path.exists(localpath):
+    max_size=256/8
+    img = PIL.Image.open(localpath)
+    img.thumbnail((max_size, max_size), PIL.Image.Resampling.LANCZOS)
+    img = np.asarray(img.convert("RGBA"), dtype=np.float32) / 255.0
+    img[..., :3] *= img[..., 3:]
+    return img
+
 
 def from_image_to_postions(img, threshold=0.1):
   # img: np.ndarray HxWx4 (RGBA premultiplied) from load_image
@@ -86,4 +98,31 @@ def looks_like_image_fitness(world, cfg, image=None, emoji=None, threshold=0.1):
   chamfer = (min_a_to_b + min_b_to_a).item()
 
   fitness = -chamfer
+  return float(fitness)
+
+
+def separation_fitness(world, cfg, min_dist: float = 0.1) -> float:
+  """
+  Fitness encouraging particles to be at least `min_dist` away from all others.
+
+  Uses the nearest-neighbor distance per particle. If the nearest neighbor distance
+  is >= `min_dist`, then all neighbor distances are >= `min_dist` as well.
+
+  Returns negative mean shortfall below `min_dist` (i.e., -mean(ReLU(min_dist - nn_dist))).
+  Higher is better; best possible is 0 when all nn_dist >= min_dist.
+  """
+  if world.x is None:
+    return float(-1e6)
+  if world.x.shape[0] <= 1:
+    # single particle trivially satisfies separation
+    return float(0.0)
+
+  pos = world.x  # (N,2) torch.Tensor on cfg.device
+  d = torch.cdist(pos, pos)  # (N,N)
+  N = d.shape[0]
+  # ignore self-distances
+  d = d + torch.eye(N, device=pos.device) * 1e6
+  nn = d.min(dim=1).values  # nearest neighbor distance per particle
+  shortfall = torch.relu(min_dist - nn)
+  fitness = -shortfall.mean().item()
   return float(fitness)

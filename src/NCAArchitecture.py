@@ -101,19 +101,19 @@ class ParticleNCA(nn.Module):
 			outs.append(torch.cos(f * t))
 		return torch.cat(outs, dim=-1)
 
-	def _knn_with_cutoff(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
-		# Compute kNN indices and masks within cutoff
-		# Returns indices (N, k_eff) and mask (N, k_eff) where k_eff = min(k, N)
+	def _hard_cutoff_neighbors(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+		# Compute all neighbors within cutoff distance (hard cutoff)
+		# Returns edge indices as src (neighbor j) and dst (target i) tensors
 		with torch.no_grad():
 			dist = self._pairwise_dist(x)  # (N,N)
 			# Exclude self by setting large distance on diagonal
 			N = dist.shape[0]
 			dist = dist + torch.eye(N, device=x.device) * 1e6
-			# Get k nearest, but cap at N
-			effective_k = min(self.k, N)
-			knn_dist, knn_idx = torch.topk(dist, k=effective_k, dim=1, largest=False)
-			mask = knn_dist <= self.cutoff
-		return knn_idx, mask	
+			# Get all pairs within cutoff
+			mask = dist <= self.cutoff  # (N, N)
+			# Convert to edge list
+			dst, src = torch.where(mask)  # dst = target nodes, src = neighbor nodes
+		return src, dst
 	
 	def forward(
 		self,
@@ -125,13 +125,12 @@ class ParticleNCA(nn.Module):
 		N = x.shape[0]
 		device = x.device
 
-		knn_idx, knn_mask = self._knn_with_cutoff(x)  # (N,k_eff), (N,k_eff)
-		k_eff = knn_idx.shape[1]
+		src, dst = self._hard_cutoff_neighbors(x)  # (E,), (E,) where E = number of edges
+		E = src.shape[0]
 
-		# Build global edge list (flattened)
-		src = knn_idx.reshape(-1)              # neighbor indices j (E,)
-		dst = torch.arange(N, device=device).unsqueeze(1).expand(-1, k_eff).reshape(-1)  # target i (E,)
-		edge_mask = knn_mask.reshape(-1)       # (E,)
+		# Build global edge list - already in the right format from _hard_cutoff_neighbors
+		# src: neighbor indices j (E,)
+		# dst: target indices i (E,)
 
 		# Gather features per edge
 		x_i = x[dst]        # (E,2)
@@ -162,14 +161,14 @@ class ParticleNCA(nn.Module):
 		rel_in = torch.cat([rel_geom, ang_feat, d_mol], dim=-1)  # (E, F)
 
 		msg = self.message_mlp(rel_in)  # (E,H)
-		msg = msg * edge_mask.unsqueeze(-1).float()  # zero out invalid edges
 
 		# Aggregate messages to nodes via index_add
 		agg = torch.zeros(N, msg.shape[-1], device=device)
 		agg.index_add_(0, dst, msg)
 		if self.aggregate == "mean":
 			denom = torch.zeros(N, 1, device=device)
-			denom.index_add_(0, dst, edge_mask.unsqueeze(-1).float())
+			ones = torch.ones(E, 1, device=device)
+			denom.index_add_(0, dst, ones)
 			denom = torch.clamp(denom, min=1.0)
 			agg = agg / denom
 		elif self.aggregate != "sum":

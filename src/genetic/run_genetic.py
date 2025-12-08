@@ -6,21 +6,21 @@ from genetic.simulation_genetic import GAConfig, genetic_train
 
 def main():
     cfg = GAConfig(
-        population_size=16,
-        elite_frac=0.25,
+        population_size=1,
+        elite_frac=0.2,
         mutation_std=0.05,
         crossover_frac=0.5,
-        generations=100,
-        rollout_steps=500,
+        generations=600,
+        rollout_steps=200,
         dt=0.1,
-        target_count=99,
-        max_cells=1000,
+        target_count=128,
+        max_cells=2000,
         circle_weight=2.0,
         device="cpu",
         resume_path=None,  # or None to train from scratch
-        name = "genetic_emoji_server",
+        name = "genetic_emoji_second",
         emoji="🦎",
-        N_times = 3,
+        N_times = 2,
 
     )
     best_model, hist = genetic_train(cfg)
