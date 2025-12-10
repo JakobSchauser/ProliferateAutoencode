@@ -1,11 +1,11 @@
 #!/bin/bash
 #
-#SBATCH --job-name=NCA_run         # Job name
+#SBATCH --job-name=make_visualization  # Job name
 #SBATCH --output=logs/%x_%j.out        # Output log (%x=job name, %j=job ID) - change as needed
 #SBATCH --error=logs/%x_%j.err         # Error log - change as needed
 #SBATCH --partition=main               # Partition to submit to
 #SBATCH --gres=gpu:1                   # Request GPU - Comment out or delete for no GPU
-#SBATCH --cpus-per-task=64           # CPU cores per task
+#SBATCH --cpus-per-task=32            # CPU cores per task
 #SBATCH --mem=64G                      # RAM for job
 #SBATCH --time=04:00:00                # Time limit hh:mm:ss 
 #SBATCH --mail-type=END,FAIL           # Email notifications
@@ -21,7 +21,7 @@ conda activate $ENV
 
 # ---- Choose script to run ----
 # Set either a Python file OR Notebook file below:
-PYTHON_SCRIPT="run_genetic.py"        # e.g. scripts/train.py
+PYTHON_SCRIPT="show_checkpoint.py"        # e.g. scripts/train.py
 NOTEBOOK_FILE=""        # e.g. notebooks/experiment.ipynb
 
 # ---- Run a Python script (.py) ----

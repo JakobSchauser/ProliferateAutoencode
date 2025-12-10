@@ -20,7 +20,7 @@ class GAConfig:
     mutation_std: float = 0.05
     crossover_frac: float = 0.5
     generations: int = 200
-    rollout_steps: int = 1000
+    rollout_steps: int = 200
     dt: float = 0.1
     target_count: int = 4096
     max_cells: int = 10000  # Allow overshoot beyond target
@@ -138,6 +138,7 @@ def _save_checkpoint(cfg: GAConfig, generation: int, population: List[ParticleNC
             "aggregate": cfg.aggregate,
             "positional_encoding": cfg.positional_encoding,
             "angle_sin_cos": cfg.angle_sin_cos,
+            "rollout_steps": cfg.rollout_steps,
         },
     }
     torch.save(state, ckpt_path)
@@ -172,24 +173,82 @@ from target_functions import correct_cell_count_fitness, looks_like_image_fitnes
 # Select fitness function: use emoji/image-based shape matching if configured
 def fitness_fn(world, cfg):
     if cfg.image is not None or cfg.emoji is not None:
-        return looks_like_image_fitness(world, cfg, image=cfg.image, emoji=cfg.emoji) + separation_fitness(world, cfg)*0.1
+        return looks_like_image_fitness(world, cfg, image=cfg.image, emoji=cfg.emoji) # + separation_fitness(world, cfg)*0.1
     return correct_cell_count_fitness(world, cfg)
 
-def evaluate_model(cfg: GAConfig, model: ParticleNCA, N_times : int= 1) -> float:
-  world = ParticleWorld(cfg, model)
-  world.reset(n0=1)
+def evaluate_model(
+        cfg: GAConfig,
+        model: ParticleNCA,
+        N_times: int = 1,
+        return_positions: bool = False,
+        record_interval: int = 1,
+        return_fitness_per_frame: bool = False,
+):
+    """
+    Evaluate a model for cfg.rollout_steps. Optionally return rollout positions.
 
-  fitness = 0.0
-  for iii in range(cfg.rollout_steps):
-    world.step()
-    if (iii+1) % (cfg.rollout_steps // N_times) == 0:
-        fitness += fitness_fn(world, cfg)
+    - When return_positions=False (default): returns float fitness (as before).
+    - When return_positions=True: returns a tuple (fitness, positions, fitnesses_per_frame?) where
+        positions is List[Tensor] sampled every `record_interval` steps. If
+        return_fitness_per_frame=True, also returns a list of per-sample fitness values; otherwise []
 
-    fitness /= N_times
-  # Fitness: negative squared distance from target count (higher is better)
-  return float(fitness)
+    Note: If N_times > 1 and return_positions=True, the recorded positions correspond to the
+    FINAL repetition only; fitness is averaged over N_times.
+    """
+    world = ParticleWorld(cfg, model)
+    world.reset(n0=1)
 
-def genetic_train(cfg: GAConfig) -> Tuple[ParticleNCA, List[float]]:
+    record_positions: List[torch.Tensor] = []
+    record_fitness: List[float] = []
+
+    total_fitness = 0.0
+    # For compatibility with previous behavior, we average fitness over N_times
+    for rep in range(max(1, N_times)):
+        # Reset world each repetition
+        if rep > 0:
+            world.reset(n0=1)
+        # If recording positions, clear for this repetition and only keep the final repetition
+        if return_positions and rep == N_times - 1:
+            record_positions = []
+            record_fitness = []
+
+        for t in range(cfg.rollout_steps):
+            world.step()
+            if return_positions and rep == N_times - 1 and ((t + 1) % record_interval == 0):
+                if world.x is not None:
+                    record_positions.append(world.x.detach().clone())
+                    if return_fitness_per_frame:
+                        record_fitness.append(fitness_fn(world, cfg))
+
+        # accumulate fitness after finishing the rollout
+        total_fitness += fitness_fn(world, cfg)
+
+    avg_fitness = float(total_fitness / max(1, N_times))
+
+    if not return_positions:
+        return avg_fitness
+    else:
+        return avg_fitness, record_positions, record_fitness
+
+def rollout_states(cfg: GAConfig, model: ParticleNCA, steps: int, interval: int = 1) -> Tuple[List[torch.Tensor], List[float]]:
+    """
+    Rollout the world for `steps`, returning sampled positions and fitness values.
+    - positions: list of torch.Tensors (N_t, 2) sampled every `interval` steps
+    - fitnesses: list of floats aligned with positions list
+    """
+    world = ParticleWorld(cfg, model)
+    world.reset(n0=64)
+    positions: List[torch.Tensor] = []
+    fitnesses: List[float] = []
+    for t in range(steps):
+        world.step()
+        if (t + 1) % interval == 0:
+            if world.x is not None:
+                positions.append(world.x.detach().clone())
+                fitnesses.append(fitness_fn(world, cfg))
+    return positions, fitnesses
+
+def genetic_train(cfg: GAConfig, use_threads: bool = True, max_workers: Optional[int] = None) -> Tuple[ParticleNCA, List[float]]:
     # Initialize or resume population
     if cfg.resume_path:
         start_gen, population, history = _load_checkpoint(cfg)
@@ -211,19 +270,46 @@ def genetic_train(cfg: GAConfig) -> Tuple[ParticleNCA, List[float]]:
     elite_k = max(1, int(cfg.elite_frac * cfg.population_size))
 
     for g in range(start_gen, cfg.generations):
-        # Evaluate population (threaded)
+        print(f"[GA] Generation {g+1}/{cfg.generations} — evaluating {len(population)} individuals...")
         scores: List[float] = [float('-inf')] * len(population)
-        max_workers = min(16, len(population))
-        with ThreadPoolExecutor(max_workers=max_workers) as ex:
-            future_to_idx = {ex.submit(evaluate_model, cfg, m, cfg.N_times): i for i, m in enumerate(population)}
-            for fut in as_completed(future_to_idx):
-                i = future_to_idx[fut]
+        if use_threads:
+            mw = min(16, len(population)) if max_workers is None else min(max_workers, len(population))
+            print(f"[GA] Using threaded evaluation with {mw} worker(s).")
+            completed = 0
+            ex = ThreadPoolExecutor(max_workers=mw)
+            try:
+                future_to_idx = {ex.submit(evaluate_model, cfg, m, cfg.N_times): i for i, m in enumerate(population)}
+                for fut in as_completed(future_to_idx):
+                    i = future_to_idx[fut]
+                    try:
+                        res = fut.result()
+                        scores[i] = float(res if not isinstance(res, tuple) else res[0])
+                    except Exception as e:
+                        scores[i] = float('-inf')
+                        print(f"[Warn] Evaluation failed at gen {g+1}, individual {i}: {e}")
+                    completed += 1
+                    if completed % max(1, len(population)//4) == 0 or completed == len(population):
+                        print(f"[GA] Evaluation progress: {completed}/{len(population)} done")
+            except KeyboardInterrupt:
+                print("[GA] KeyboardInterrupt received. Cancelling pending evaluations and shutting down threads...")
+                ex.shutdown(wait=False, cancel_futures=True)
+                raise
+            finally:
+                ex.shutdown(wait=True)
+        else:
+            print("[GA] Using sequential evaluation.")
+            for i, m in enumerate(population):
                 try:
-                    scores[i] = float(fut.result())
+                    res = evaluate_model(cfg, m, cfg.N_times)
+                    scores[i] = float(res if not isinstance(res, tuple) else res[0])
                 except Exception as e:
                     scores[i] = float('-inf')
-                    print(f"[Warn] Evaluation failed at gen {g}, individual {i}: {e}")
-        history.append(max(scores))
+                    print(f"[Warn] Evaluation failed at gen {g+1}, individual {i}: {e}")
+                if (i+1) % max(1, len(population)//4) == 0 or (i+1) == len(population):
+                    print(f"[GA] Evaluation progress: {i+1}/{len(population)} done")
+        best_score_gen = max(scores)
+        history.append(best_score_gen)
+        print(f"[GA] Generation {g+1} evaluation complete. Best score={best_score_gen:.4f}")
 
         # Select elites
         ranked = sorted(zip(scores, population), key=lambda x: x[0], reverse=True)
@@ -275,6 +361,9 @@ def genetic_train(cfg: GAConfig) -> Tuple[ParticleNCA, List[float]]:
             _save_checkpoint(cfg, g + 1, population, history)
 
     # Return best individual
-    final_scores = [evaluate_model(cfg, m) for m in population]
+    final_scores = []
+    for m in population:
+        res = evaluate_model(cfg, m)
+        final_scores.append(float(res if not isinstance(res, tuple) else res[0]))
     best_idx = int(torch.tensor(final_scores).argmax().item())
     return population[best_idx], history

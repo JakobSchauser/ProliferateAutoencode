@@ -6,75 +6,40 @@ import torch
 import numpy as np
 import matplotlib.pyplot as plt
 
-from genetic.simulation_genetic import GAConfig, _load_checkpoint, ParticleWorld
+from genetic.simulation_genetic import GAConfig, _load_checkpoint, evaluate_model
 from genetic.target_functions import load_emoji, from_image_to_postions
 from NCAArchitecture import ParticleNCA
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
-
-def load_best_from_checkpoint(resume_path: str) -> ParticleNCA:
-    cfg = GAConfig(resume_path=resume_path)
+def load_best_from_checkpoint(resume_path: str, rollout_steps: int = 1) -> ParticleNCA:
+    cfg = GAConfig(resume_path=resume_path, rollout_steps=rollout_steps,)
     start_gen, population, history = _load_checkpoint(cfg)
-    # Pick first individual from loaded population
-    # Alternatively, re-evaluate and pick best; for speed, just use index 0
-    model = population[0]
     print(f"Loaded checkpoint gen={start_gen}, population size={len(population)}, history len={len(history)}")
-    return model
+        # Evaluate all models in parallel and pick the one with highest fitness
+    if not population:
+        raise ValueError("Checkpoint contained an empty population")
+    scores = [float('-inf')] * len(population)
+    max_workers = min(16, len(population))
+    n_times = max(1, getattr(cfg, 'rollout_steps', 1))
+    # print("N_times for evaluation:", n_times)
+    # with ThreadPoolExecutor(max_workers=max_workers) as ex:
+    #     future_to_idx = {ex.submit(evaluate_model, cfg, m, n_times): i for i, m in enumerate(population)}
+    #     for fut in as_completed(future_to_idx):
+    #         i = future_to_idx[fut]
+    #         try:
+    #             res = fut.result()
+    #             scores[i] = float(res if not isinstance(res, tuple) else res[0])
+    #         except Exception as e:
+    #             scores[i] = float('-inf')
+    #             print(f"[Warn] Evaluation failed for model {i}: {e}")
+    # best_idx = max(range(len(scores)), key=lambda i: scores[i])
+    # best_score = scores[best_idx]
+    # print(f"Selected best model index={best_idx} with fitness={best_score:.4f}")
+    best_idx = 0
+    return population[best_idx]
 
 
-def rollout_and_show(model: ParticleNCA, steps: int = 300, dt: float = 0.1, device: str = "cpu", interval: int = 10, max_cells: int = 256, target_emoji: str | None = None):
-    cfg = GAConfig(dt=dt, device=device, max_cells=max_cells)
-    world = ParticleWorld(cfg, model)
-    world.reset(n0=1)
-
-    xs = []
-    ts = []
-    for t in range(steps):
-        world.step()
-        if (t + 1) % interval == 0:
-            if world.x is not None:
-                xs.append(world.x.detach().cpu())
-                ts.append(t + 1)
-                print(f"Step {t+1}/{steps} | cells={world.x.shape[0]}")
-
-    # Prepare target overlay points once (normalized [-1,1] coords)
-    target_pts = None
-    if target_emoji is not None:
-        try:
-            img = load_emoji(target_emoji)
-            target_pts = from_image_to_postions(img)
-        except Exception as e:
-            print(f"[Warn] Failed to load target emoji '{target_emoji}': {e}")
-
-    # Plot snapshots every `interval`
-    n = len(xs)
-    cols = min(5, n)
-    rows = (n + cols - 1) // cols
-    fig, axes = plt.subplots(rows, cols, figsize=(3*cols, 3*rows), squeeze=False)
-    for i, (snap, tstep) in enumerate(zip(xs, ts)):
-        r = i // cols
-        c = i % cols
-        pos = snap.numpy()
-        ax = axes[r][c]
-        # Overlay target points if provided (normalized space)
-        if target_pts is not None and target_pts.shape[0] > 0:
-            ax.scatter(target_pts[:, 0], target_pts[:, 1], s=2, alpha=0.3, color='black', label='target', zorder=1)
-        # Draw current positions
-        ax.scatter(pos[:, 0], pos[:, 1], s=4, alpha=0.7, color='tab:blue', zorder=2)
-        ax.set_title(f"t={tstep} (n={pos.shape[0]})")
-        ax.set_xlabel("x")
-        ax.set_ylabel("y")
-        ax.set_aspect('equal', adjustable='box')
-        # Keep consistent normalized axes to match target scaling when available
-        if target_pts is not None and target_pts.shape[0] > 0:
-            ax.set_xlim(-1.1, 1.1)
-            ax.set_ylim(-1.1, 1.1)
-    # Hide any unused axes
-    for j in range(n, rows*cols):
-        r = j // cols
-        c = j % cols
-        axes[r][c].axis('off')
-    plt.tight_layout()
-    plt.show()
+# Removed rollout_and_show; use evaluate_model return for visualization
 
 
 def rollout_and_show_video(model: ParticleNCA, steps: int = 300, dt: float = 0.1, device: str = "cpu", out_path: str = "rollout.mp4", fps: int = 30, s: int = 6, max_cells: int = 256, target_emoji: str | None = None):
@@ -83,8 +48,6 @@ def rollout_and_show_video(model: ParticleNCA, steps: int = 300, dt: float = 0.1
     or GIF if it ends with .gif. If out_path is None, defaults to 'rollout.mp4'.
     """
     cfg = GAConfig(dt=dt, device=device, max_cells=max_cells)
-    world = ParticleWorld(cfg, model)
-    world.reset(n0=1)
 
     fig, ax = plt.subplots(figsize=(6, 6))
     scat = ax.scatter([], [], s=s, alpha=0.8, cmap='viridis', zorder=2)
@@ -103,14 +66,25 @@ def rollout_and_show_video(model: ParticleNCA, steps: int = 300, dt: float = 0.1
             print(f"[Warn] Failed to load target emoji '{target_emoji}': {e}")
     target_artist = None
 
-    positions = []
+    # Use evaluate_model to get positions and per-frame fitness for visualization
+    cfg = GAConfig(dt=dt, device=device, max_cells=max_cells, rollout_steps=steps)
+    res = evaluate_model(
+        cfg,
+        model,
+        N_times=1,
+        return_positions=True,
+        record_interval=1,
+        return_fitness_per_frame=True,
+    )
+    if isinstance(res, tuple):
+        avg_fit, positions_t, fitnesses = res
+    else:
+        avg_fit = float(res)
+        positions_t, fitnesses = [], []
+    positions = [p.detach().cpu().numpy() for p in positions_t]
     colors = []
     prev_n = 0
-    for t in range(steps):
-        world.step()
-        pos = world.x.detach().cpu().numpy() if world.x is not None else np.empty((0,2), dtype=np.float32)
-        positions.append(pos)
-        # Color newly divided cells differently (red-ish via higher colormap value)
+    for pos in positions:
         n = pos.shape[0]
         frame_colors = np.full(n, 0.2, dtype=np.float32)
         if n > prev_n:
@@ -149,7 +123,11 @@ def rollout_and_show_video(model: ParticleNCA, steps: int = 300, dt: float = 0.1
         col = colors[frame]
         scat.set_offsets(pos)
         scat.set_array(col)
-        ax.set_title(f"t={frame+1} (n={pos.shape[0]})")
+        fit = fitnesses[frame] if frame < len(fitnesses) else None
+        title = f"t={frame+1} (n={pos.shape[0]})"
+        if fit is not None:
+            title += f" | fitness={fit:.3f}"
+        ax.set_title(title)
         return (scat,) if target_artist is None else (target_artist, scat)
 
     from matplotlib.animation import FuncAnimation, FFMpegWriter, PillowWriter
@@ -183,16 +161,16 @@ def rollout_and_show_video(model: ParticleNCA, steps: int = 300, dt: float = 0.1
 
 
 def main():
-    steps = 200
+    steps = 100
     every = 20
-    name = "genetic_emoji_second_600"
+    name = "genetic_emoji_fourth_100"
 
 
     max_cells = 1000
 
     # Provide path to a checkpoint like checkpoints/ga_gen_50.pt
     resume_path = os.environ.get("GA_RESUME", os.path.join(os.path.dirname(__file__), "checkpoints", f"{name}.pt"))
-    model = load_best_from_checkpoint(resume_path)
+    model = load_best_from_checkpoint(resume_path, rollout_steps=steps)
     # Show snapshots grid
     # rollout_and_show(model, steps=steps, dt=0.1, device="cpu", interval=every, max_cells=max_cells)
     # Also export a short video

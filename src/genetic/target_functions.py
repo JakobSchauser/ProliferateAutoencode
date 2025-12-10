@@ -19,13 +19,14 @@ def load_image(url, max_size=256/8):
 
 
 def load_emoji(emoji):
-  code = hex(ord(emoji))[2:].lower()
-  url = 'https://github.com/googlefonts/noto-emoji/blob/main/png/128/emoji_u%s.png?raw=true'%code
+  # code = hex(ord(emoji))[2:].lower()
+  # url = 'https://github.com/googlefonts/noto-emoji/blob/main/png/128/emoji_u%s.png?raw=true'%code
 
+  # print(code)
   # return load_image(url)
 
   # for testing
-  localpath = "2.png"
+  localpath = "lizard.png"
   if os.path.exists(localpath):
     max_size=256/8
     img = PIL.Image.open(localpath)
@@ -97,8 +98,15 @@ def looks_like_image_fitness(world, cfg, image=None, emoji=None, threshold=0.1):
   min_b_to_a = dists.min(dim=0).values.mean()
   chamfer = (min_a_to_b + min_b_to_a).item()
 
-  fitness = -chamfer
-  return float(fitness)
+
+  # cardinality penalty
+  alpha = 1.
+  n_pred = pts.shape[0]
+  n_target = target_pts.shape[0]
+  cardinality_penalty = (abs(n_pred - n_target)) * alpha  # alpha ~ 1e-3 → 1e-1
+
+  fitness = chamfer + cardinality_penalty
+  return -float(fitness)
 
 
 def separation_fitness(world, cfg, min_dist: float = 0.1) -> float:
