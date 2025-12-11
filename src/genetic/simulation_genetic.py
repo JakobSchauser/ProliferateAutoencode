@@ -177,12 +177,12 @@ def fitness_fn(world, cfg):
     return correct_cell_count_fitness(world, cfg)
 
 def evaluate_model(
-        cfg: GAConfig,
-        model: ParticleNCA,
-        N_times: int = 1,
-        return_positions: bool = False,
-        record_interval: int = 1,
-        return_fitness_per_frame: bool = False,
+    cfg: GAConfig,
+    model: ParticleNCA,
+    N_times: int = 1,
+    return_positions: bool = False,
+    record_interval: int = 1,
+    return_fitness_per_frame: bool = False,
 ):
     """
     Evaluate a model for cfg.rollout_steps. Optionally return rollout positions.
@@ -192,8 +192,8 @@ def evaluate_model(
         positions is List[Tensor] sampled every `record_interval` steps. If
         return_fitness_per_frame=True, also returns a list of per-sample fitness values; otherwise []
 
-    Note: If N_times > 1 and return_positions=True, the recorded positions correspond to the
-    FINAL repetition only; fitness is averaged over N_times.
+    Note: N_times controls how many times the fitness is sampled within ONE rollout.
+    We sample the fitness N_times uniformly across the rollout and average those samples.
     """
     world = ParticleWorld(cfg, model)
     world.reset(n0=1)
@@ -201,29 +201,30 @@ def evaluate_model(
     record_positions: List[torch.Tensor] = []
     record_fitness: List[float] = []
 
+    # Determine sampling steps for fitness: N_times uniformly spaced over rollout
+    n_samples = max(1, int(N_times))
+    if n_samples >= cfg.rollout_steps:
+        sample_steps = set(range(1, cfg.rollout_steps + 1))
+    else:
+        # Use evenly spaced indices in 1..rollout_steps
+        sample_steps = set(
+            max(1, min(cfg.rollout_steps, int(round(s))))
+            for s in torch.linspace(1, cfg.rollout_steps, steps=n_samples).tolist()
+        )
+
     total_fitness = 0.0
-    # For compatibility with previous behavior, we average fitness over N_times
-    for rep in range(max(1, N_times)):
-        # Reset world each repetition
-        if rep > 0:
-            world.reset(n0=1)
-        # If recording positions, clear for this repetition and only keep the final repetition
-        if return_positions and rep == N_times - 1:
-            record_positions = []
-            record_fitness = []
+    for t in range(cfg.rollout_steps):
+        world.step()
+        if return_positions and ((t + 1) % record_interval == 0):
+            if world.x is not None:
+                record_positions.append(world.x.detach().clone())
+                if return_fitness_per_frame:
+                    record_fitness.append(fitness_fn(world, cfg))
+        # sample fitness at selected steps
+        if (t + 1) in sample_steps:
+            total_fitness += float(fitness_fn(world, cfg))
 
-        for t in range(cfg.rollout_steps):
-            world.step()
-            if return_positions and rep == N_times - 1 and ((t + 1) % record_interval == 0):
-                if world.x is not None:
-                    record_positions.append(world.x.detach().clone())
-                    if return_fitness_per_frame:
-                        record_fitness.append(fitness_fn(world, cfg))
-
-        # accumulate fitness after finishing the rollout
-        total_fitness += fitness_fn(world, cfg)
-
-    avg_fitness = float(total_fitness / max(1, N_times))
+    avg_fitness = float(total_fitness / max(1, n_samples))
 
     if not return_positions:
         return avg_fitness
@@ -316,11 +317,11 @@ def genetic_train(cfg: GAConfig, use_threads: bool = True, max_workers: Optional
         elites = [clone_model(m) for _, m in ranked[:elite_k]]
 
         # Reproduce
-        # Order: elites, 3 random, mutated elites (1 per elite), then fill with elite crossovers
+        # Order: elites, 2 random, mutated elites (2 per elite)
         new_pop: List[ParticleNCA] = elites.copy()
 
-        # Add up to 3 fresh random individuals each generation
-        for _ in range(3):
+        # Add up to 2 fresh random individuals each generation
+        for _ in range(4):
             if len(new_pop) >= cfg.population_size:
                 break
             m_rand = ParticleNCA(
@@ -341,13 +342,21 @@ def genetic_train(cfg: GAConfig, use_threads: bool = True, max_workers: Optional
             mutate_model(child, cfg.mutation_std)
             new_pop.append(child)
 
-        # Fill the remaining slots with crossover children from elites, then mutate
+        # # Fill the remaining slots with crossover children from elites, then mutate
+        # while len(new_pop) < cfg.population_size:
+        #     a = random.choice(elites)
+        #     b = random.choice(elites)
+        #     child = crossover_models(a, b, cfg.crossover_frac)
+        #     mutate_model(child, cfg.mutation_std)
+        #     new_pop.append(child)
+
+        # fill the remaining slots with more random children from elites
         while len(new_pop) < cfg.population_size:
-            a = random.choice(elites)
-            b = random.choice(elites)
-            child = crossover_models(a, b, cfg.crossover_frac)
-            mutate_model(child, cfg.mutation_std)
+            e = random.choice(elites)
+            child = clone_model(e)
+            mutate_model(child, cfg.mutation_std*2.)
             new_pop.append(child)
+
 
         population = new_pop
 
