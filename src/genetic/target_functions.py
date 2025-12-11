@@ -121,7 +121,7 @@ def looks_like_image_fitness(world, cfg, image=None, emoji=None, threshold=0.1):
 
   # fitness = - chamfer + ( target_covered + cells_covered) #+ overlap_penalty #+ cardinality_penalty
   # fitness = target_covered + cells_covered
-  fitness = target_covered 
+  fitness = target_covered  + cells_covered*0.2
   return float(fitness)
 
 

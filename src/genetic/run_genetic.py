@@ -17,12 +17,12 @@ def main():
         max_cells=2000,
         device="cpu",
         resume_path=None,  # or None to train from scratch
-        name = "genetic_emoji_sixth",
+        name = "genetic_emoji_seventh",
         emoji="🦎",
-        N_times = 8,
+        N_times = 16,
 
     )
-    best_model, hist = genetic_train(cfg, max_workers=32)
+    best_model, hist = genetic_train(cfg, use_threads=False, max_workers=1)
     print("Genetic training done. Best fitness history length:", len(hist))
 
 

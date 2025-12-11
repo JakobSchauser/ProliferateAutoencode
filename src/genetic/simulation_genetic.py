@@ -366,7 +366,7 @@ def genetic_train(cfg: GAConfig, use_threads: bool = True, max_workers: Optional
         print(f"Gen {g+1}/{cfg.generations} | best_fitness={best:.2f} | worst_fitness={worst:.2f} | median_elite_fitness={median_elite:.2f}")
 
         # Save checkpoint every 10 generations
-        if (g + 1) % 50 == 0:
+        if (g + 1) % 10 == 0:
             _save_checkpoint(cfg, g + 1, population, history)
 
     # Return best individual
