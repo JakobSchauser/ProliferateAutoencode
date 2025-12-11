@@ -1,2 +1,3 @@
 *.pt
 src/genetic/logs/*
+*.pyc
