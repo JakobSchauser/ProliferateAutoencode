@@ -115,13 +115,13 @@ def looks_like_image_fitness(world, cfg, image=None, emoji=None, threshold=0.1):
 
 
     # Coverage: fraction of target points with any source closer than eps
-  eps = 0.05  # tune: how close a cell must be to count as "covering" a target point
+  eps = 0.02  # tune: how close a cell must be to count as "covering" a target point
   target_covered = (dists.min(dim=0).values < eps).float().mean()  # in [0,1]
   cells_covered = (dists.min(dim=1).values < eps).float().mean()  # in [0,1]
 
   # fitness = - chamfer + ( target_covered + cells_covered) #+ overlap_penalty #+ cardinality_penalty
   # fitness = target_covered + cells_covered
-  fitness = target_covered  + cells_covered*0.2
+  fitness = target_covered  + cells_covered*1.
   return float(fitness)
 
 

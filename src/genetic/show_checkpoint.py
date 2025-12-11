@@ -163,7 +163,7 @@ def rollout_and_show_video(model: ParticleNCA, steps: int = 300, dt: float = 0.1
 def main():
     steps = 100
     every = 20
-    name = "genetic_emoji_sixth_20"
+    name = "genetic_emoji_seventh_60"
 
 
     max_cells = 1000
