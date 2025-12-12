@@ -321,7 +321,7 @@ def genetic_train(cfg: GAConfig, use_threads: bool = True, max_workers: Optional
         new_pop: List[ParticleNCA] = elites.copy()
 
         # Add up to 2 fresh random individuals each generation
-        for _ in range(4):
+        for _ in range(2):
             if len(new_pop) >= cfg.population_size:
                 break
             m_rand = ParticleNCA(
@@ -366,8 +366,9 @@ def genetic_train(cfg: GAConfig, use_threads: bool = True, max_workers: Optional
         print(f"Gen {g+1}/{cfg.generations} | best_fitness={best:.2f} | worst_fitness={worst:.2f} | median_elite_fitness={median_elite:.2f}")
 
         # Save checkpoint every 10 generations
-        if (g + 1) % 200 == 0:
-            _save_checkpoint(cfg, g + 1, population, history)
+        if (g + 1) % 5 == 0:
+            tp = int((g + 1) / 50)*50
+            _save_checkpoint(cfg, tp, population, history)
 
     # Return best individual
     final_scores = []

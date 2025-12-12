@@ -28,7 +28,7 @@ def load_emoji(emoji):
   # for testing
   localpath = "lizard.png"
   if os.path.exists(localpath):
-    max_size=256/8
+    max_size=256/4
     img = PIL.Image.open(localpath)
     img.thumbnail((max_size, max_size), PIL.Image.Resampling.LANCZOS)
     img = np.asarray(img.convert("RGBA"), dtype=np.float32) / 255.0
@@ -115,7 +115,7 @@ def looks_like_image_fitness(world, cfg, image=None, emoji=None, threshold=0.1):
 
 
     # Coverage: fraction of target points with any source closer than eps
-  eps = 0.02  # tune: how close a cell must be to count as "covering" a target point
+  eps = 0.05  # tune: how close a cell must be to count as "covering" a target point
   target_covered = (dists.min(dim=0).values < eps).float().mean()  # in [0,1]
   cells_covered = (dists.min(dim=1).values < eps).float().mean()  # in [0,1]
 
