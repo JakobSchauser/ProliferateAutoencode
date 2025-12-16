@@ -161,11 +161,9 @@ def rollout_and_show_video(model: ParticleNCA, steps: int = 300, dt: float = 0.1
 
 
 def main():
-    steps = 100
+    steps = 500
     every = 20
-    name = "genetic_emoji_eighth_n2_contain_200"
-
-
+    name = "mediumrange_longtime_0"
     max_cells = 500
 
     # Provide path to a checkpoint like checkpoints/ga_gen_50.pt
