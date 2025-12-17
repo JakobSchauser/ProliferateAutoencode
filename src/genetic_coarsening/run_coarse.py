@@ -2,7 +2,7 @@ import os
 import sys
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
 
-from genetic.simulation_genetic import GAConfig, genetic_train
+from simulation_coarse import GAConfig, genetic_train
 
 def main():
     cfg = GAConfig(
@@ -10,17 +10,17 @@ def main():
         elite_frac=0.2,
         mutation_std=0.001,
         generations=400,
-        rollout_steps=500,
+        rollout_steps=200,
         dt=0.1,
         target_count=128,
         max_cells=500,
         positional_encoding=False,
         device="cpu",
-        cutoff=0.2,
+        cutoff=0.1,
         resume_path=None,  # or None to train from scratch
-        name = "mediumrange_longtime",
+        name = "tjæst",
         emoji="🦎",
-        N_times = 40,
+        N_times = 15,
 
     )
     best_model, hist = genetic_train(cfg, use_threads=False, max_workers=16)

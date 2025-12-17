@@ -12,6 +12,8 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
 
 from NCAArchitecture import ParticleNCA
 
+from target_functions import looks_like_vitruvian
+
 
 @dataclass
 class GAConfig:
@@ -168,13 +170,10 @@ def _load_checkpoint(cfg: GAConfig) -> Tuple[int, List[ParticleNCA], List[float]
     return start_gen, population, history
 
 
-from target_functions import correct_cell_count_fitness, looks_like_image_fitness, separation_fitness
 
-# Select fitness function: use emoji/image-based shape matching if configured
+# Select fitness function: 
 def fitness_fn(world, cfg):
-    if cfg.image is not None or cfg.emoji is not None:
-        return looks_like_image_fitness(world, cfg, image=cfg.image, emoji=cfg.emoji) # + separation_fitness(world, cfg)*0.1
-    return correct_cell_count_fitness(world, cfg)
+    return looks_like_vitruvian(world, cfg, level = 1, threshold = 0.05)
 
 def evaluate_model(
     cfg: GAConfig,
@@ -282,12 +281,9 @@ def genetic_train(cfg: GAConfig, use_threads: bool = True, max_workers: Optional
                 future_to_idx = {ex.submit(evaluate_model, cfg, m, cfg.N_times): i for i, m in enumerate(population)}
                 for fut in as_completed(future_to_idx):
                     i = future_to_idx[fut]
-                    try:
-                        res = fut.result()
-                        scores[i] = float(res if not isinstance(res, tuple) else res[0])
-                    except Exception as e:
-                        scores[i] = float('-inf')
-                        print(f"[Warn] Evaluation failed at gen {g+1}, individual {i}: {e}")
+                    res = fut.result()
+                    scores[i] = float(res if not isinstance(res, tuple) else res[0])
+
                     completed += 1
                     if completed % max(1, len(population)//4) == 0 or completed == len(population):
                         print(f"[GA] Evaluation progress: {completed}/{len(population)} done")
@@ -300,12 +296,8 @@ def genetic_train(cfg: GAConfig, use_threads: bool = True, max_workers: Optional
         else:
             print("[GA] Using sequential evaluation.")
             for i, m in enumerate(population):
-                try:
-                    res = evaluate_model(cfg, m, cfg.N_times)
-                    scores[i] = float(res if not isinstance(res, tuple) else res[0])
-                except Exception as e:
-                    scores[i] = float('-inf')
-                    print(f"[Warn] Evaluation failed at gen {g+1}, individual {i}: {e}")
+                res = evaluate_model(cfg, m, cfg.N_times)
+                scores[i] = float(res if not isinstance(res, tuple) else res[0])
                 if (i+1) % max(1, len(population)//4) == 0 or (i+1) == len(population):
                     print(f"[GA] Evaluation progress: {i+1}/{len(population)} done")
         best_score_gen = max(scores)

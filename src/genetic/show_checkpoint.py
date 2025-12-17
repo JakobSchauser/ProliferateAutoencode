@@ -161,12 +161,10 @@ def rollout_and_show_video(model: ParticleNCA, steps: int = 300, dt: float = 0.1
 
 
 def main():
-    steps = 100
+    steps = 500
     every = 20
-    name = "genetic_emoji_seventh_60"
-
-
-    max_cells = 1000
+    name = "mediumrange_longtime_0"
+    max_cells = 500
 
     # Provide path to a checkpoint like checkpoints/ga_gen_50.pt
     resume_path = os.environ.get("GA_RESUME", os.path.join(os.path.dirname(__file__), "checkpoints", f"{name}.pt"))
