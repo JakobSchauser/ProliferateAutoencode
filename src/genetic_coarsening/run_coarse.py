@@ -9,8 +9,8 @@ def main():
         population_size=24,
         elite_frac=0.2,
         mutation_std=0.001,
-        generations=400,
-        rollout_steps=200,
+        generations=200,
+        rollout_steps=500,
         dt=0.1,
         target_count=128,
         max_cells=500,
@@ -20,7 +20,7 @@ def main():
         resume_path=None,  # or None to train from scratch
         name = "tjæst",
         emoji="🦎",
-        N_times = 15,
+        N_times = 20,
 
     )
     best_model, hist = genetic_train(cfg, use_threads=False, max_workers=16)

@@ -12,7 +12,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
 
 from NCAArchitecture import ParticleNCA
 
-from target_functions import looks_like_vitruvian
+from target_functions import looks_like_vitruvian, looks_like_vitruvian_gaussian
 
 
 @dataclass
@@ -173,7 +173,8 @@ def _load_checkpoint(cfg: GAConfig) -> Tuple[int, List[ParticleNCA], List[float]
 
 # Select fitness function: 
 def fitness_fn(world, cfg):
-    return looks_like_vitruvian(world, cfg, level = 1, threshold = 0.05)
+    # return looks_like_vitruvian(world, cfg, level = 1, threshold = 0.01)
+    return looks_like_vitruvian_gaussian(world, cfg, level = 0, gauss_width=0.1, threshold = 0.8)
 
 def evaluate_model(
     cfg: GAConfig,

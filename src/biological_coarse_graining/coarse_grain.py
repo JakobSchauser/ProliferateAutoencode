@@ -16,7 +16,7 @@ import matplotlib.pyplot as plt
 from pathlib import Path
 import argparse
 
-levels = [1, 2, 3, 4]
+levels = [0, 1, 2, 3, 4]
 
 here = Path(__file__).resolve().parent
 
@@ -24,6 +24,7 @@ outdir = here / "results"
 
 # Collect four variant masks
 image_paths = [
+	str(here / "Vitruvian_0.png"),
 	str(here / "Vitruvian_1.png"),
 	str(here / "Vitruvian_2.png"),
 	str(here / "Vitruvian_3.png"),
@@ -32,6 +33,7 @@ image_paths = [
 
 # Default number of points to return for each coarse-graining level (1-4).
 _DEFAULT_POINTS_MAP = {
+	0: 128,
 	1: 128,
 	2: 256,
 	3: 512,
@@ -182,7 +184,7 @@ def sample_positions_grid_from_image(
 	h, w = arr.shape[0], arr.shape[1]
 
 	# Base grid resolution; start modestly to avoid zero-cell sizes.
-	base = 16*2
+	base = 16*2*4
 	n_side = max(1, int(base * np.sqrt(int(2** max(0, int(corse_graining) - 1)))))
 
 	xs = np.linspace(0, w - 1, num=n_side)
@@ -222,7 +224,7 @@ def sample_positions_from_image(
 	The returned array has integer dtype and columns ordered as (x, y).
 	"""
 
-	image_path = image_paths[corse_graining - 1],
+	image_path = image_paths[corse_graining],
 
 	mode = MODE.lower()
 	if mode == "grid":

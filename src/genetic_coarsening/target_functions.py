@@ -8,51 +8,28 @@ import torch
 from biological_coarse_graining.coarse_grain import sample_positions_from_image
 
 def looks_like_vitruvian(world, cfg, level = 1, threshold=0.1):
-  """
-  Fitness that encourages the current particle positions to match an image silhouette.
-  Uses a bidirectional Chamfer distance between particle positions and image mask points.
-
-  Provide either `image` (URL or np.ndarray) or `emoji` (single character) to load a target.
-  Returns negative Chamfer (higher is better when shapes match).
-  """
   if world.x is None:
-    return float(-1e6)
-  # Load target points
+    assert False, "world.x is None in looks_like_vitruvian"
   
   target_pts_np = sample_positions_from_image(level)
 
   if target_pts_np.shape[0] == 0:
     print("no target pts")
-    return float(-1e6)  # harsh penalty if no target points
+    assert False, "no target points in looks_like_vitruvian"
 
   target_pts = torch.tensor(target_pts_np, dtype=torch.float32, device=cfg.device)
 
   pts = torch.tensor(world.x.detach().cpu().numpy(), dtype=torch.float32, device=cfg.device)
-  if pts.shape[0] == 0:
-    return float(-1e6)
 
   dists = torch.cdist(pts, target_pts)  # (Na,Nb)
-  # min_a_to_b = dists.min(dim=1).values.mean()
-  # min_b_to_a = dists.min(dim=0).values.mean()
-  # chamfer = (min_a_to_b + min_b_to_a).item()
-
-
-  # # cardinality penalty
-  # alpha = 1.
-  # n_pred = pts.shape[0]
-  # n_target = target_pts.shape[0]
-  # cardinality_penalty = (abs(n_pred - n_target)) * alpha  # alpha ~ 1e-3 → 1e-1
-
-
-  # # # overlap penalty
-  # nn = torch.cdist(pts, pts) + torch.eye(pts.shape[0], device=pts.device) * 1e6
-  # min_nn = nn.min(dim=1).values
-  # overlap_penalty = 0.5 * torch.mean(torch.exp(-min_nn / 0.05))  # tune scale
-
 
   # Coverage: fraction of target points with any source closer than eps
   target_covered = (dists.min(dim=0).values < threshold).float().mean()#/target_pts.shape[0]  # in [0,1]
-  cells_covered = (dists.min(dim=1).values < threshold).float().sum()/cfg.max_cells  # in [0,1]
+  cells_covered = (dists.min(dim=1).values < threshold).float().sum()/target_pts.shape[0]  # in [0,1]
+
+  cell_cover_gaussian_score = torch.exp(- (dists **2) / (2*(threshold**2)) ).sum(dim=1)
+  
+  cells_covered = min(cells_covered, 1.0)
 
   # fitness = - chamfer + ( target_covered + cells_covered) #+ overlap_penalty #+ cardinality_penalty
   # fitness = target_covered + cells_covered
@@ -85,3 +62,37 @@ def separation_fitness(world, cfg, min_dist: float = 0.1) -> float:
   shortfall = torch.relu(min_dist - nn)
   fitness = -shortfall.mean().item()
   return float(fitness)
+
+
+def looks_like_vitruvian_gaussian(world, cfg, level: int = 1, gauss_width: float = 0.1, threshold: float = 0.2) -> float:
+  """
+  Gaussian max-coverage fitness:
+  - Treat each cell position as a Gaussian bump with width `gauss_width`.
+  - For each target point, evaluate the field as the max over all Gaussians.
+  - Score is the fraction of target points with field >= `threshold`.
+
+  Returns a value in [0,1].
+  """
+  if world.x is None:
+    assert False, "world.x is None in looks_like_vitruvian_gaussian"
+
+  target_pts_np = sample_positions_from_image(level)
+  if target_pts_np.shape[0] == 0:
+    print("no target pts")
+    assert False, "no target points in looks_like_vitruvian_gaussian"
+
+  target_pts = torch.tensor(target_pts_np, dtype=torch.float32, device=cfg.device)
+  pts = world.x
+  if pts.shape[0] == 0:
+    return float(0.0)
+
+  d2 = torch.cdist(target_pts, pts) ** 2  # (Nb, Na)
+  sigma2 = max(1e-12, float(gauss_width) ** 2)
+  gauss = torch.exp(- d2 / (2.0 * sigma2))
+  field_max = gauss.max(dim=1).values  # (Nb,)
+  covered_target = (field_max >= float(threshold)).float().mean()
+
+  field_max_ct = gauss.max(dim=0).values  # (Na,)
+  covered_cells = (field_max_ct >= float(threshold)).float().mean()
+
+  return (float(covered_target) + float(covered_cells))*0.5
