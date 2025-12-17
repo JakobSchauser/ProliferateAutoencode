@@ -13,12 +13,12 @@ def main():
         rollout_steps=100,
         dt=0.1,
         target_count=128,
-        max_cells=500,
+        max_cells=1000,
         device="cpu",
         resume_path=None,  #"checkpoints/genetic_emoji_seventh_60.pt",  # or None to train from scratch
         name = "genetic_emoji_eighth",
         emoji="🦎",
-        N_times = 16,
+        N_times = 2,
 
     )
     best_model, hist = genetic_train(cfg, use_threads=False, max_workers=16)
