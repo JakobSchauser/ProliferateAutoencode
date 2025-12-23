@@ -75,3 +75,9 @@ C:/Python313/python.exe src/genetic/run_genetic.py
 ```
 
 Adjust `GAConfig` for population size, mutation, crossover, generations, and target count.
+
+todo:
+inverse regularization - promote state-diversity
+predict dS
+give global position/give rotation as parameter
+
