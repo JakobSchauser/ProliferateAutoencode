@@ -1,15 +1,14 @@
 import math
-from typing import Optional, Tuple
+from typing import Tuple
 
 import numpy as np
 
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
-from scipy.spatial import Voronoi
+from torch_geometric.nn import TransformerConv
 
 
-class ParticleNCA(nn.Module):
+class ParticleNCA_edge(nn.Module):
 	"""
 	Off-grid (particle-based) Neural Cellular Automata in PyTorch.
 
@@ -40,29 +39,23 @@ class ParticleNCA(nn.Module):
 		cutoff: float = 0.25,
 		message_hidden: int = 64,
 		update_hidden: int = 64,
-		aggregate: str = "sum",  # or "mean"
-		positional_encoding: bool = True,
-		angle_sin_cos: bool = True,
+		heads: int = 2,
 	):
 		super().__init__()
 		self.molecule_dim = molecule_dim
 		self.k = k
 		self.cutoff = cutoff
-		self.aggregate = aggregate
-		self.positional_encoding = positional_encoding
-		self.angle_sin_cos = angle_sin_cos
+		self.heads = heads
 
 		# Message MLP takes relative inputs
 		# Inputs per edge:
-		# - dx, dy, r, optionally PE for r
+		# - dx, dy, r
 		# - sin(d_angle), cos(d_angle) or raw d_angle
-		# - (mol_j - mol_i) molecules difference
+		# - (mol_j - mol_i) molecules difference and mol_i
 		rel_geom_dim = 3  # dx, dy, r
-		if self.positional_encoding:
-			rel_geom_dim += 4  # simple Fourier features for r
 
-		angle_dim = 2 if self.angle_sin_cos else 1
-		rel_input_dim = rel_geom_dim + angle_dim + molecule_dim + molecule_dim  # include mol_i
+		angle_dim = 2
+		rel_input_dim = rel_geom_dim + angle_dim + (2 * molecule_dim)
 
 		self.message_mlp = nn.Sequential(
 			nn.Linear(rel_input_dim, message_hidden),
@@ -73,17 +66,21 @@ class ParticleNCA(nn.Module):
 			nn.ReLU(inplace=True),
 		)
 
-		# Update MLP maps aggregated message + self features to deltas
-		# Self features fed to update head: angle repr + molecules + generation
-		self_feat_dim = (2 if self.angle_sin_cos else 1) + molecule_dim + 1
-		upd_in = message_hidden + self_feat_dim
-		self.update_mlp = nn.Sequential(
-			nn.Linear(upd_in, update_hidden),
-			nn.ReLU(inplace=True),
-			nn.Linear(update_hidden, update_hidden),
-			nn.ReLU(inplace=True),
-			nn.Linear(update_hidden, update_hidden),
-			nn.ReLU(inplace=True),
+		# Node feature dimensionality (used as node input to attention conv)
+		self.self_feat_dim = 2 + molecule_dim + 1
+		# Edge attributes passed into attention conv: encoded edge + self (dst) features
+		edge_attr_dim = message_hidden + self.self_feat_dim
+		# Attention-based message passing that consumes edge_attr
+		self.attn_conv = TransformerConv(
+			in_channels=self.self_feat_dim,
+			out_channels=update_hidden,
+			heads=self.heads,
+			concat=False,
+			edge_dim=edge_attr_dim,
+			dropout=0.0,
+		)
+		# Node head maps attended features to deltas
+		self.node_head = nn.Sequential(
 			nn.Linear(update_hidden, update_hidden),
 			nn.ReLU(inplace=True),
 			nn.Linear(update_hidden, 2 + 1 + molecule_dim + 1),  # dx, dy, d_angle, d_molecules, divide_logit
@@ -100,63 +97,19 @@ class ParticleNCA(nn.Module):
 		d = xi - xj
 		return torch.sqrt(torch.clamp((d ** 2).sum(-1), min=1e-12))
 
-	@staticmethod
-	def _fourier_features(t: torch.Tensor, n_freqs: int = 2) -> torch.Tensor:
-		# Simple Fourier features: [sin(2^k t), cos(2^k t)] for k=0..n_freqs-1
-		outs = []
-		for k in range(n_freqs):
-			f = 2.0 ** k
-			outs.append(torch.sin(f * t))
-			outs.append(torch.cos(f * t))
-		return torch.cat(outs, dim=-1)
-
 	def _hard_cutoff_neighbors(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
-		# Previous k-NN cutoff implementation kept for reference:
+		"""Symmetrized directed edges using distance cutoff."""
 		with torch.no_grad():
 			dist = self._pairwise_dist(x)
 			N = dist.shape[0]
 			dist = dist + torch.eye(N, device=x.device) * 1e6
 			mask = dist <= self.cutoff
-			dst, src = torch.where(mask)
-		return src, dst
-		with torch.no_grad():
-			points = x.detach().cpu().numpy()
-			N = points.shape[0]
-			if N <= 1:
-				return (
-					torch.empty(0, dtype=torch.long, device=x.device),
-					torch.empty(0, dtype=torch.long, device=x.device),
-				)
-			if N < 4:
-				# Fallback to dense distance cutoff when Voronoi cannot be constructed
-				dist = self._pairwise_dist(x)
-				dist = dist + torch.eye(N, device=x.device) * 1e6
-				mask = dist <= self.cutoff
-				dst, src = torch.where(mask)
-				return src, dst
-			vor = Voronoi(points)
-			pairs = vor.ridge_points  # (M,2) unique undirected edges
-			if pairs.size == 0:
-				return (
-					torch.empty(0, dtype=torch.long, device=x.device),
-					torch.empty(0, dtype=torch.long, device=x.device),
-				)
-			# limit neighbors by cutoff to avoid long-range connections
-			vec = points[pairs[:, 0]] - points[pairs[:, 1]]
-			if self.cutoff is not None:
-				mask = (vec ** 2).sum(axis=1) <= float(self.cutoff*10.) ** 2
-				pairs = pairs[mask]
-				vec = vec[mask]
-			if pairs.size == 0:
-				return (
-					torch.empty(0, dtype=torch.long, device=x.device),
-					torch.empty(0, dtype=torch.long, device=x.device),
-				)
-			# add both directions for message passing
-			pairs_bidirectional = np.vstack([pairs, pairs[:, ::-1]])
-			pairs_unique = np.unique(pairs_bidirectional, axis=0)
-			src = torch.from_numpy(pairs_unique[:, 1]).to(x.device, dtype=torch.long)
-			dst = torch.from_numpy(pairs_unique[:, 0]).to(x.device, dtype=torch.long)
+			# take only upper triangle to form undirected pairs, then duplicate to directed
+			tri_mask = torch.triu(mask, diagonal=1)
+			dst_u, src_u = torch.where(tri_mask)
+			# duplicate to both directions
+			src = torch.cat([src_u, dst_u], dim=0)
+			dst = torch.cat([dst_u, src_u], dim=0)
 		return src, dst
 	
 	def forward(
@@ -167,10 +120,9 @@ class ParticleNCA(nn.Module):
 		generation: torch.Tensor,  # (N, 1) integer-like counter
 	) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
 		N = x.shape[0]
-		device = x.device
 
 		src, dst = self._hard_cutoff_neighbors(x)  # (E,), (E,) where E = number of edges
-		E = src.shape[0]
+		edge_index = torch.stack([src, dst], dim=0)  # (2, E)
 
 		# Build global edge list - already in the right format from _hard_cutoff_neighbors
 		# src: neighbor indices j (E,)
@@ -188,45 +140,26 @@ class ParticleNCA(nn.Module):
 		dxdy = x_j - x_i                # (E,2)
 		r = torch.sqrt(torch.clamp((dxdy ** 2).sum(-1, keepdim=True), min=1e-12))  # (E,1)
 		d_angle = angle_j - angle_i     # (E,1)
-		if self.angle_sin_cos:
-			ang_feat = torch.cat([torch.sin(d_angle), torch.cos(d_angle)], dim=-1)  # (E,2)
-		else:
-			ang_feat = d_angle  # (E,1)
+		ang_feat = torch.cat([torch.sin(d_angle), torch.cos(d_angle)], dim=-1)  # (E,2)
 		d_mol = mol_j - mol_i           # (E,C)
 
-		# Optional positional encoding on r (no generation as edge feature)
-		if self.positional_encoding:
-			r_pe = self._fourier_features(r)  # (E,4)
-			rel_geom = torch.cat([dxdy, r, r_pe], dim=-1)  # (E, 2+1+4)
-		else:
-			rel_geom = torch.cat([dxdy, r], dim=-1)  # (E,3)
+		rel_geom = torch.cat([dxdy, r], dim=-1)  # (E,3)
 
 		# Per-edge input to message MLP
 		rel_in = torch.cat([rel_geom, ang_feat, d_mol, mol_i], dim=-1)  # (E + molecule_dim + angle_dim + rel_geom_dim)
 
 		msg = self.message_mlp(rel_in)  # (E,H)
 
-		# Aggregate messages to nodes via index_add
-		agg = torch.zeros(N, msg.shape[-1], device=device)
-		agg.index_add_(0, dst, msg)
-		if self.aggregate == "mean":
-			denom = torch.zeros(N, 1, device=device)
-			ones = torch.ones(E, 1, device=device)
-			denom.index_add_(0, dst, ones)
-			denom = torch.clamp(denom, min=1.0)
-			agg = agg / denom
-		elif self.aggregate != "sum":
-			raise ValueError(f"Unknown aggregate: {self.aggregate}")
-
 		# Self features for update head
-		if self.angle_sin_cos:
-			self_ang = torch.cat([torch.sin(angle), torch.cos(angle)], dim=-1)  # (N,2)
-		else:
-			self_ang = angle  # (N,1)
+		self_ang = torch.cat([torch.sin(angle), torch.cos(angle)], dim=-1)  # (N,2)
 		self_feat = torch.cat([self_ang, molecules, generation], dim=-1)  # (N, 2/1 + C + 1)
 
-		upd_in = torch.cat([agg, self_feat], dim=-1)  # (N, H + self_feat)
-		upd = self.update_mlp(upd_in)  # (N, 2 + 1 + C + 1)
+		# Edge attributes include encoded edge plus destination self features
+		edge_attr = torch.cat([msg, self_feat[dst]], dim=-1)
+
+		# Attention-based aggregation of edge-informed messages
+		node_attn = self.attn_conv(self_feat, edge_index, edge_attr)  # (N, update_hidden)
+		upd = self.node_head(node_attn)  # (N, 2 + 1 + C + 1)
 
 		dxdy = upd[:, 0:2]
 		dtheta = upd[:, 2:3]
@@ -243,7 +176,7 @@ def _quick_test():
 	x = torch.rand(N, 2)
 	angle = torch.rand(N, 1) * (2 * math.pi) - math.pi
 	mol = torch.randn(N, C)
-	nca = ParticleNCA(molecule_dim=C, k=16, cutoff=0.2)
+	nca = ParticleNCA_edge(molecule_dim=C, k=16, cutoff=0.2)
 	gen = torch.zeros(N, 1)
 	dxdy, dtheta, dmol, div_logit = nca(x, angle, mol, gen)
 	assert dxdy.shape == (N, 2)

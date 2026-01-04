@@ -1,18 +1,19 @@
 import math
 import random
-from dataclasses import dataclass
+from dataclasses import dataclass, asdict, fields
 from typing import Callable, List, Optional, Tuple
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import torch
-
+import numpy as np
 import os
 import sys
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
 
 from NCAArchitecture import ParticleNCA
 
-from target_functions import looks_like_vitruvian, looks_like_vitruvian_gaussian
+from target_functions import looks_like_vitruvian, looks_like_vitruvian_gaussian, looks_like_vitruvian_gaussian_rotated, color_and_cover
+from biological_coarse_graining.coarse_grain import sample_positions_from_image, image_paths
 
 
 @dataclass
@@ -43,10 +44,12 @@ class GAConfig:
     image: Optional[str] = None
     emoji: Optional[str] = "🐣"
     N_times : int = 1  # Number of times to evaluate each model and average fitness
-
+    cell_size: float = 0.1
+    noise_eta: float = 1e-4 # magnitude of gaussian noise injected into updates
+    # Note: global rotation angle is chosen per evaluation run
 
 class ParticleWorld:
-    def __init__(self, cfg: GAConfig, model: ParticleNCA):
+    def __init__(self, cfg: GAConfig, model: ParticleNCA, global_angle: float = 0.0):
         self.cfg = cfg
         self.device = torch.device(cfg.device)
         self.model = model.to(self.device)
@@ -54,12 +57,37 @@ class ParticleWorld:
         self.angle = None
         self.mol = None
         self.gen = None
+        self.global_angle = float(global_angle)
+
+
+    def add_globals(self):
+        # x,y = np.cos(self.global_angle), np.sin(self.global_angle)
+        # self.mol[:, 0] = x  # global angle cos
+        # self.mol[:, 1] = y  # global angle sin
+        self.mol[:, 0] = self.x[:, 0] #* 2.0 - 1.0  # normalized x pos
+        self.mol[:, 1] = self.x[:, 1]# * 2.0 - 1.0  # normalized y pos
 
     def reset(self, n0: int = 1):
         self.x = torch.zeros(n0, 2, device=self.device)
         self.angle = torch.zeros(n0, 1, device=self.device)
         self.mol = torch.zeros(n0, self.cfg.n_molecules, device=self.device)
         self.gen = torch.zeros(n0, 1, device=self.device)
+        # Encode per-run global angle as a dedicated molecule channel (index 0)
+        self.add_globals()
+
+
+    def reset_to_positions(self, level : int):
+        pos = sample_positions_from_image(level)
+        pos = torch.tensor(pos, dtype=torch.float32, device=self.device)
+        positions = torch.zeros_like(pos)
+        N = pos.shape[0]
+        self.x = positions.clone()
+        # self.x = positions.to(self.device)
+        self.angle = torch.zeros(N, 1, device=self.device)
+        self.mol = torch.zeros(N, self.cfg.n_molecules, device=self.device)
+        self.gen = torch.zeros(N, 1, device=self.device)
+        # Encode per-run global angle as a dedicated molecule channel (index 0)
+        self.add_globals()
 
     @torch.no_grad()
     def _perform_divisions(self, divide_mask: torch.Tensor):
@@ -81,19 +109,28 @@ class ParticleWorld:
         x_child = self.x[sel] + (torch.randn_like(self.x[sel]) * jitter_pos)
         angle_child = self.angle[sel] + (torch.randn_like(self.angle[sel]) * jitter_ang)
         mol_child = self.mol[sel]
-        gen_child = self.gen[sel] + 1.0
+        self.gen[sel] += 1.0
+        gen_child = self.gen[sel].clone()
         self.x = torch.cat([self.x, x_child], dim=0)
         self.angle = torch.cat([self.angle, angle_child], dim=0)
         self.mol = torch.cat([self.mol, mol_child], dim=0)
         self.gen = torch.cat([self.gen, gen_child], dim=0)
-
+        # Ensure global angle channel remains constant for new cells
+        self.add_globals()
+        
     def step(self):
         dxdy, dtheta, dmol, div_logit = self.model(self.x, self.angle, self.mol, self.gen)
+        eta = float(self.cfg.noise_eta)
+        dxdy = dxdy + torch.randn_like(dxdy) * eta
+        dtheta = dtheta + torch.randn_like(dtheta) * eta
+        dmol = dmol + torch.randn_like(dmol) * eta
         self.x = self.x + dxdy * self.cfg.dt
         self.angle = self.angle + dtheta * self.cfg.dt
         self.mol = self.mol + dmol * self.cfg.dt
+        # Keep global angle molecule channel immutable across steps
+        self.add_globals()
         divide = (torch.sigmoid(div_logit) > 0.5).squeeze(-1)
-        self._perform_divisions(divide)
+        # self._perform_divisions(divide)
 
 
 
@@ -132,6 +169,7 @@ def _save_checkpoint(cfg: GAConfig, generation: int, population: List[ParticleNC
     state = {
         "generation": generation,
         "history": history,
+        "cfg": asdict(cfg),
         "population": [m.state_dict() for m in population],
         "model_meta": {
             "molecule_dim": cfg.n_molecules,
@@ -152,6 +190,16 @@ def _load_checkpoint(cfg: GAConfig) -> Tuple[int, List[ParticleNCA], List[float]
     state = torch.load(cfg.resume_path, map_location="cpu")
     start_gen = int(state.get("generation", 0))
     history = list(state.get("history", []))
+    # If a serialized cfg exists, update the provided cfg in-place to match it
+    saved_cfg_dict = state.get("cfg", None)
+    if isinstance(saved_cfg_dict, dict):
+        cfg_field_names = {f.name for f in fields(GAConfig)}
+        for k, v in saved_cfg_dict.items():
+            if k in cfg_field_names:
+                try:
+                    setattr(cfg, k, v)
+                except Exception:
+                    pass
     meta = state.get("model_meta", {})
     population_sd = state.get("population", [])
     population: List[ParticleNCA] = []
@@ -169,20 +217,32 @@ def _load_checkpoint(cfg: GAConfig) -> Tuple[int, List[ParticleNCA], List[float]
     print(f"[Checkpoint] Loaded population from {cfg.resume_path} (gen {start_gen})")
     return start_gen, population, history
 
+    
 
-
-# Select fitness function: 
+# # Select fitness function: 
 def fitness_fn(world, cfg):
-    # return looks_like_vitruvian(world, cfg, level = 1, threshold = 0.01)
-    return looks_like_vitruvian_gaussian(world, cfg, level = 0, gauss_width=0.1, threshold = 0.8)
+    # Rotated target using the per-run global angle
+    # return looks_like_vitruvian_gaussian_rotated(world, cfg, level=0, gauss_width=cfg.cell_size, threshold=0.85, angle_rad=world.global_angle)
+    return color_and_cover(world, cfg, level=0, gauss_width=cfg.cell_size, threshold=0.85, angle_rad=world.global_angle)
+    return looks_like_vitruvian_gaussian_rotated_colored(world, cfg, level=0, gauss_width=cfg.cell_size, threshold=0.85, angle_rad=world.global_angle)
+
+
+
+from target_functions import color_fitness, color_fitness_rotated
+# Select fitness function: 
+# def fitness_fn(world, cfg):
+#     return color_fitness_rotated(world, cfg, angle_rad=world.global_angle)
+
 
 def evaluate_model(
     cfg: GAConfig,
     model: ParticleNCA,
     N_times: int = 1,
     return_positions: bool = False,
+    return_model_states: bool = False,
     record_interval: int = 1,
     return_fitness_per_frame: bool = False,
+    global_angle: Optional[float] = None,
 ):
     """
     Evaluate a model for cfg.rollout_steps. Optionally return rollout positions.
@@ -195,10 +255,17 @@ def evaluate_model(
     Note: N_times controls how many times the fitness is sampled within ONE rollout.
     We sample the fitness N_times uniformly across the rollout and average those samples.
     """
-    world = ParticleWorld(cfg, model)
-    world.reset(n0=1)
+    # Choose per-run global angle if not provided
+    if global_angle is None:
+        global_angle = random.uniform(0.0, 2.0 * math.pi)
+    world = ParticleWorld(cfg, model, global_angle=global_angle)
+    # world.reset(n0=1)
+
+    # positions_from
+    world.reset_to_positions(level = 0)
 
     record_positions: List[torch.Tensor] = []
+    record_states: List = []
     record_fitness: List[float] = []
 
     # Determine sampling steps for fitness: N_times uniformly spaced over rollout
@@ -209,7 +276,7 @@ def evaluate_model(
         # Use evenly spaced indices in 1..rollout_steps
         sample_steps = set(
             max(1, min(cfg.rollout_steps, int(round(s))))
-            for s in torch.linspace(1, cfg.rollout_steps, steps=n_samples).tolist()
+            for s in torch.linspace(cfg.rollout_steps//2, cfg.rollout_steps, steps=n_samples).tolist()
         )
 
     total_fitness = 0.0
@@ -218,6 +285,8 @@ def evaluate_model(
         if return_positions and ((t + 1) % record_interval == 0):
             if world.x is not None:
                 record_positions.append(world.x.detach().clone())
+                states = np.hstack((world.angle.detach().clone(), world.mol.detach().clone()))
+                record_states.append(states)
                 if return_fitness_per_frame:
                     record_fitness.append(fitness_fn(world, cfg))
         # sample fitness at selected steps
@@ -226,10 +295,15 @@ def evaluate_model(
 
     avg_fitness = float(total_fitness / max(1, n_samples))
 
-    if not return_positions:
-        return avg_fitness
-    else:
-        return avg_fitness, record_positions, record_fitness
+    ret = [avg_fitness]
+    if return_model_states:
+        ret.append(record_states)
+    if return_positions:
+        ret.append(record_positions)
+    if return_fitness_per_frame:
+        ret.append(record_fitness)
+
+    return tuple(ret)
 
 def rollout_states(cfg: GAConfig, model: ParticleNCA, steps: int, interval: int = 1) -> Tuple[List[torch.Tensor], List[float]]:
     """
@@ -237,7 +311,8 @@ def rollout_states(cfg: GAConfig, model: ParticleNCA, steps: int, interval: int 
     - positions: list of torch.Tensors (N_t, 2) sampled every `interval` steps
     - fitnesses: list of floats aligned with positions list
     """
-    world = ParticleWorld(cfg, model)
+    # Use zero angle for utility rollout sampling
+    world = ParticleWorld(cfg, model, global_angle=0.0)
     world.reset(n0=64)
     positions: List[torch.Tensor] = []
     fitnesses: List[float] = []
@@ -297,7 +372,7 @@ def genetic_train(cfg: GAConfig, use_threads: bool = True, max_workers: Optional
         else:
             print("[GA] Using sequential evaluation.")
             for i, m in enumerate(population):
-                res = evaluate_model(cfg, m, cfg.N_times)
+                res = evaluate_model(cfg, m, cfg.N_times, global_angle=0.0)
                 scores[i] = float(res if not isinstance(res, tuple) else res[0])
                 if (i+1) % max(1, len(population)//4) == 0 or (i+1) == len(population):
                     print(f"[GA] Evaluation progress: {i+1}/{len(population)} done")
@@ -313,8 +388,8 @@ def genetic_train(cfg: GAConfig, use_threads: bool = True, max_workers: Optional
         # Order: elites, 2 random, mutated elites (2 per elite)
         new_pop: List[ParticleNCA] = elites.copy()
 
-        # Add up to 2 fresh random individuals each generation
-        for _ in range(2):
+        # Add up to 1 fresh random individuals each generation
+        for _ in range(1):
             if len(new_pop) >= cfg.population_size:
                 break
             m_rand = ParticleNCA(
@@ -336,19 +411,19 @@ def genetic_train(cfg: GAConfig, use_threads: bool = True, max_workers: Optional
             new_pop.append(child)
 
         # # Fill the remaining slots with crossover children from elites, then mutate
-        # while len(new_pop) < cfg.population_size:
-        #     a = random.choice(elites)
-        #     b = random.choice(elites)
-        #     child = crossover_models(a, b, cfg.crossover_frac)
-        #     mutate_model(child, cfg.mutation_std)
-        #     new_pop.append(child)
-
-        # fill the remaining slots with more random children from elites
         while len(new_pop) < cfg.population_size:
-            e = random.choice(elites)
-            child = clone_model(e)
-            mutate_model(child, cfg.mutation_std*5.)
+            a = random.choice(elites)
+            b = random.choice(elites)
+            child = crossover_models(a, b, cfg.crossover_frac)
+            mutate_model(child, cfg.mutation_std)
             new_pop.append(child)
+
+        # # fill the remaining slots with more random children from elites
+        # while len(new_pop) < cfg.population_size:
+        #     e = random.choice(elites)
+        #     child = clone_model(e)
+        #     mutate_model(child, cfg.mutation_std*5.)
+        #     new_pop.append(child)
 
 
         population = new_pop
