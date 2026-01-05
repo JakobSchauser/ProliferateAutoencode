@@ -255,6 +255,10 @@ def sample_positions_from_image(
 
 	positions = positions / 500.
 
+	if corse_graining == 1:
+		positions[:,0] *= 0.5
+		positions[:,1] *= 1.8
+
 	# target_color = np.where(positions[:,0] > 0., 1., -1.)
 	
 	cxx = positions[:,0]

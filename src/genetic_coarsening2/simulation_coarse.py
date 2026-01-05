@@ -58,11 +58,17 @@ class ParticleWorld:
 
 
     def add_globals(self):
-        # x,y = np.cos(self.global_angle), np.sin(self.global_angle)
-        # self.mol[:, 0] = x  # global angle cos
-        # self.mol[:, 1] = y  # global angle sin
-        self.mol[:, 0] = self.x[:, 0] #* 2.0 - 1.0  # normalized x pos
-        self.mol[:, 1] = self.x[:, 1]# * 2.0 - 1.0  # normalized y pos
+        x,y = np.cos(self.global_angle), np.sin(self.global_angle)
+        self.mol[:, 0] = x  # global angle cos
+        self.mol[:, 1] = y  # global angle sin
+        # self.mol[:, 0] = self.x[:, 0] #* 2.0 - 1.0  # normalized x pos
+        # self.mol[:, 1] = self.x[:, 1]# * 2.0 - 1.0  # normalized y pos
+
+    def add_first_time_globals(self):   
+        xx, yy = self.x[:,0], self.x[:,1]
+        self.mol[:, 2] = (xx - xx.min())/(xx.max() - xx.min())  # normalized x pos
+        self.mol[:, 3] = (yy - yy.min())/(yy.max() - yy.min())  # normalized y pos
+        self.add_globals()
 
     def reset(self, n0: int = 1):
         self.x = torch.zeros(n0, 2, device=self.device)
@@ -71,12 +77,13 @@ class ParticleWorld:
         self.gen = torch.zeros(n0, 1, device=self.device)
         # Encode per-run global angle as a dedicated molecule channel (index 0)
         # self.add_globals()
+        self.add_first_time_globals()
 
 
     def reset_to_positions(self, level : int):
         pos = sample_positions_from_image(level)
-        pos = torch.tensor(pos, dtype=torch.float32, device=self.device)
-        positions = torch.zeros_like(pos)
+        positions = torch.tensor(pos, dtype=torch.float32, device=self.device)
+        # positions = torch.zeros_like(pos)
         N = pos.shape[0]
         self.x = positions.clone()
         # self.x = positions.to(self.device)
@@ -84,7 +91,8 @@ class ParticleWorld:
         self.mol = torch.zeros(N, self.cfg.n_molecules, device=self.device)
         self.gen = torch.zeros(N, 1, device=self.device)
         # Encode per-run global angle as a dedicated molecule channel (index 0)
-        self.add_globals()
+        # self.add_globals()
+        self.add_first_time_globals()
 
     @torch.no_grad()
     def _perform_divisions(self, divide_mask: torch.Tensor):
@@ -125,9 +133,9 @@ class ParticleWorld:
         self.angle = self.angle + dtheta * self.cfg.dt
         self.mol = self.mol + dmol * self.cfg.dt
         # Keep global angle molecule channel immutable across steps
-        # self.add_globals()
         divide = (torch.sigmoid(div_logit) > 0.5).squeeze(-1)
-        self._perform_divisions(divide)
+        # self._perform_divisions(divide)
+        self.add_globals()
 
 
 
@@ -206,11 +214,12 @@ def _load_checkpoint(cfg: GAConfig) -> Tuple[int, List[ParticleNCA_edge], List[f
     return start_gen, population, history
 
     
-
+from target_functions import get_all_cells_to_origin_distance
 # # Select fitness function: 
 def fitness_fn(world, cfg):
     # Rotated target using the per-run global angle
-    return looks_like_vitruvian_gaussian_rotated(world, cfg, level=0, gauss_width=cfg.cell_size, threshold=0.85, angle_rad=world.global_angle)
+    # return get_all_cells_to_origin_distance(world, cfg)
+    return looks_like_vitruvian_gaussian_rotated(world, cfg, level=1, gauss_width=cfg.cell_size, threshold=0.85, angle_rad=world.global_angle)
     # return color_and_cover(world, cfg, level=0, gauss_width=cfg.cell_size, threshold=0.85, angle_rad=world.global_angle)
     # return looks_like_vitruvian_gaussian_rotated_colored(world, cfg, level=0, gauss_width=cfg.cell_size, threshold=0.85, angle_rad=world.global_angle)
 
@@ -244,13 +253,11 @@ def evaluate_model(
     We sample the fitness N_times uniformly across the rollout and average those samples.
     """
     # Choose per-run global angle if not provided
-    if global_angle is None:
-        global_angle = random.uniform(0.0, 2.0 * math.pi)
     world = ParticleWorld(cfg, model, global_angle=global_angle)
-    world.reset(n0=1)
+    # world.reset(n0=1)
 
     # positions_from
-    # world.reset_to_positions(level = 0)
+    world.reset_to_positions(level = 0)
 
     record_positions: List[torch.Tensor] = []
     record_states: List = []
@@ -293,26 +300,7 @@ def evaluate_model(
 
     return tuple(ret)
 
-def rollout_states(cfg: GAConfig, model: ParticleNCA_edge, steps: int, interval: int = 1) -> Tuple[List[torch.Tensor], List[float]]:
-    """
-    Rollout the world for `steps`, returning sampled positions and fitness values.
-    - positions: list of torch.Tensors (N_t, 2) sampled every `interval` steps
-    - fitnesses: list of floats aligned with positions list
-    """
-    # Use zero angle for utility rollout sampling
-    world = ParticleWorld(cfg, model, global_angle=0.0)
-    world.reset(n0=64)
-    positions: List[torch.Tensor] = []
-    fitnesses: List[float] = []
-    for t in range(steps):
-        world.step()
-        if (t + 1) % interval == 0:
-            if world.x is not None:
-                positions.append(world.x.detach().clone())
-                fitnesses.append(fitness_fn(world, cfg))
-    return positions, fitnesses
-
-def genetic_train(cfg: GAConfig, use_threads: bool = True, max_workers: Optional[int] = None) -> Tuple[ParticleNCA_edge, List[float]]:
+def genetic_train(cfg: GAConfig, use_threads: bool = True, max_workers: Optional[int] = None, random_start_angle: bool = False) -> Tuple[ParticleNCA_edge, List[float]]:
     # Initialize or resume population
     if cfg.resume_path:
         start_gen, population, history = _load_checkpoint(cfg)
@@ -356,8 +344,9 @@ def genetic_train(cfg: GAConfig, use_threads: bool = True, max_workers: Optional
                 ex.shutdown(wait=True)
         else:
             print("[GA] Using sequential evaluation.")
+            ang = random.uniform(0, 2*math.pi) if random_start_angle else 0.0 
             for i, m in enumerate(population):
-                res = evaluate_model(cfg, m, cfg.N_times, global_angle=0.0)
+                res = evaluate_model(cfg, m, cfg.N_times, global_angle=ang)
                 scores[i] = float(res if not isinstance(res, tuple) else res[0])
                 if (i+1) % max(1, len(population)//4) == 0 or (i+1) == len(population):
                     print(f"[GA] Evaluation progress: {i+1}/{len(population)} done")

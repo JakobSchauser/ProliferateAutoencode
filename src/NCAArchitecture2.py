@@ -55,7 +55,7 @@ class ParticleNCA_edge(nn.Module):
 		rel_geom_dim = 3  # dx, dy, r
 
 		angle_dim = 2
-		rel_input_dim = rel_geom_dim + angle_dim + (2 * molecule_dim)
+		rel_input_dim = rel_geom_dim + angle_dim + molecule_dim
 
 		self.message_mlp = nn.Sequential(
 			nn.Linear(rel_input_dim, message_hidden),
@@ -67,7 +67,8 @@ class ParticleNCA_edge(nn.Module):
 		)
 
 		# Node feature dimensionality (used as node input to attention conv)
-		self.self_feat_dim = 2 + molecule_dim + 1
+		# Components: sin(angle), cos(angle), molecules, generation, degree (n-connections)
+		self.self_feat_dim = 2 + molecule_dim + 1 + 1
 		# Edge attributes passed into attention conv: encoded edge + self (dst) features
 		edge_attr_dim = message_hidden + self.self_feat_dim
 		# Attention-based message passing that consumes edge_attr
@@ -81,6 +82,8 @@ class ParticleNCA_edge(nn.Module):
 		)
 		# Node head maps attended features to deltas
 		self.node_head = nn.Sequential(
+			nn.Linear(update_hidden, update_hidden),
+			nn.ReLU(inplace=True),
 			nn.Linear(update_hidden, update_hidden),
 			nn.ReLU(inplace=True),
 			nn.Linear(update_hidden, 2 + 1 + molecule_dim + 1),  # dx, dy, d_angle, d_molecules, divide_logit
@@ -146,13 +149,15 @@ class ParticleNCA_edge(nn.Module):
 		rel_geom = torch.cat([dxdy, r], dim=-1)  # (E,3)
 
 		# Per-edge input to message MLP
-		rel_in = torch.cat([rel_geom, ang_feat, d_mol, mol_i], dim=-1)  # (E + molecule_dim + angle_dim + rel_geom_dim)
+		rel_in = torch.cat([rel_geom, ang_feat, d_mol], dim=-1)  # (E + molecule_dim + angle_dim + rel_geom_dim)
 
 		msg = self.message_mlp(rel_in)  # (E,H)
 
 		# Self features for update head
 		self_ang = torch.cat([torch.sin(angle), torch.cos(angle)], dim=-1)  # (N,2)
-		self_feat = torch.cat([self_ang, molecules, generation], dim=-1)  # (N, 2/1 + C + 1)
+		# Degree encodes the number of neighbors (n-connections) for each node
+		degree = torch.bincount(dst, minlength=N).float().unsqueeze(-1)
+		self_feat = torch.cat([self_ang, molecules, generation, degree], dim=-1)  # (N, 2 + C + 1 + 1)
 
 		# Edge attributes include encoded edge plus destination self features
 		edge_attr = torch.cat([msg, self_feat[dst]], dim=-1)
