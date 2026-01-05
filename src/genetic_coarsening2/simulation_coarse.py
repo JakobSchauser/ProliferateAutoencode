@@ -10,7 +10,7 @@ import os
 import sys
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
 
-from NCAArchitecture import ParticleNCA
+from NCAArchitecture2 import ParticleNCA_edge
 
 from target_functions import looks_like_vitruvian, looks_like_vitruvian_gaussian, looks_like_vitruvian_gaussian_rotated, color_and_cover
 from biological_coarse_graining.coarse_grain import sample_positions_from_image, image_paths
@@ -31,9 +31,6 @@ class GAConfig:
     n_molecules: int = 16
     k: int = 16
     cutoff: float = 0.25
-    angle_sin_cos: bool = True
-    positional_encoding: bool = True
-    aggregate: str = "sum"
     # Checkpointing
     checkpoint_dir: str = "checkpoints"
     resume_path: Optional[str] = None
@@ -49,7 +46,7 @@ class GAConfig:
     # Note: global rotation angle is chosen per evaluation run
 
 class ParticleWorld:
-    def __init__(self, cfg: GAConfig, model: ParticleNCA, global_angle: float = 0.0):
+    def __init__(self, cfg: GAConfig, model: ParticleNCA_edge, global_angle: float = 0.0):
         self.cfg = cfg
         self.device = torch.device(cfg.device)
         self.model = model.to(self.device)
@@ -61,11 +58,17 @@ class ParticleWorld:
 
 
     def add_globals(self):
-        # x,y = np.cos(self.global_angle), np.sin(self.global_angle)
-        # self.mol[:, 0] = x  # global angle cos
-        # self.mol[:, 1] = y  # global angle sin
-        self.mol[:, 0] = self.x[:, 0] #* 2.0 - 1.0  # normalized x pos
-        self.mol[:, 1] = self.x[:, 1]# * 2.0 - 1.0  # normalized y pos
+        x,y = np.cos(self.global_angle), np.sin(self.global_angle)
+        self.mol[:, 0] = x  # global angle cos
+        self.mol[:, 1] = y  # global angle sin
+        # self.mol[:, 0] = self.x[:, 0] #* 2.0 - 1.0  # normalized x pos
+        # self.mol[:, 1] = self.x[:, 1]# * 2.0 - 1.0  # normalized y pos
+
+    def add_first_time_globals(self):   
+        xx, yy = self.x[:,0], self.x[:,1]
+        self.mol[:, 2] = (xx - xx.min())/(xx.max() - xx.min())  # normalized x pos
+        self.mol[:, 3] = (yy - yy.min())/(yy.max() - yy.min())  # normalized y pos
+        self.add_globals()
 
     def reset(self, n0: int = 1):
         self.x = torch.zeros(n0, 2, device=self.device)
@@ -73,13 +76,14 @@ class ParticleWorld:
         self.mol = torch.zeros(n0, self.cfg.n_molecules, device=self.device)
         self.gen = torch.zeros(n0, 1, device=self.device)
         # Encode per-run global angle as a dedicated molecule channel (index 0)
-        self.add_globals()
+        # self.add_globals()
+        self.add_first_time_globals()
 
 
     def reset_to_positions(self, level : int):
         pos = sample_positions_from_image(level)
-        pos = torch.tensor(pos, dtype=torch.float32, device=self.device)
-        positions = torch.zeros_like(pos)
+        positions = torch.tensor(pos, dtype=torch.float32, device=self.device)
+        # positions = torch.zeros_like(pos)
         N = pos.shape[0]
         self.x = positions.clone()
         # self.x = positions.to(self.device)
@@ -87,7 +91,8 @@ class ParticleWorld:
         self.mol = torch.zeros(N, self.cfg.n_molecules, device=self.device)
         self.gen = torch.zeros(N, 1, device=self.device)
         # Encode per-run global angle as a dedicated molecule channel (index 0)
-        self.add_globals()
+        # self.add_globals()
+        self.add_first_time_globals()
 
     @torch.no_grad()
     def _perform_divisions(self, divide_mask: torch.Tensor):
@@ -128,33 +133,30 @@ class ParticleWorld:
         self.angle = self.angle + dtheta * self.cfg.dt
         self.mol = self.mol + dmol * self.cfg.dt
         # Keep global angle molecule channel immutable across steps
-        self.add_globals()
         divide = (torch.sigmoid(div_logit) > 0.5).squeeze(-1)
         # self._perform_divisions(divide)
+        self.add_globals()
 
 
 
-def clone_model(model: ParticleNCA) -> ParticleNCA:
-    clone = ParticleNCA(
+def clone_model(model: ParticleNCA_edge) -> ParticleNCA_edge:
+    clone = ParticleNCA_edge(
         molecule_dim=model.molecule_dim,
         k=model.k,
         cutoff=model.cutoff,
-        aggregate=model.aggregate,
-        positional_encoding=model.positional_encoding,
-        angle_sin_cos=model.angle_sin_cos,
     )
     clone.load_state_dict(model.state_dict())
     return clone
 
 
-def mutate_model(model: ParticleNCA, std: float) -> None:
+def mutate_model(model: ParticleNCA_edge, std: float) -> None:
     with torch.no_grad():
         for p in model.parameters():
             noise = torch.randn_like(p) * std
             p.add_(noise)
 
 
-def crossover_models(parent_a: ParticleNCA, parent_b: ParticleNCA, frac: float) -> ParticleNCA:
+def crossover_models(parent_a: ParticleNCA_edge, parent_b: ParticleNCA_edge, frac: float) -> ParticleNCA_edge:
     child = clone_model(parent_a)
     with torch.no_grad():
         for (name_c, p_c), (_, p_a), (_, p_b) in zip(child.named_parameters(), parent_a.named_parameters(), parent_b.named_parameters()):
@@ -163,7 +165,7 @@ def crossover_models(parent_a: ParticleNCA, parent_b: ParticleNCA, frac: float) 
     return child
 
 
-def _save_checkpoint(cfg: GAConfig, generation: int, population: List[ParticleNCA], history: List[float]):
+def _save_checkpoint(cfg: GAConfig, generation: int, population: List[ParticleNCA_edge], history: List[float]):
     os.makedirs(cfg.checkpoint_dir, exist_ok=True)
     ckpt_path = os.path.join(cfg.checkpoint_dir, f"{cfg.name}_{generation}.pt")
     state = {
@@ -175,9 +177,6 @@ def _save_checkpoint(cfg: GAConfig, generation: int, population: List[ParticleNC
             "molecule_dim": cfg.n_molecules,
             "k": cfg.k,
             "cutoff": cfg.cutoff,
-            "aggregate": cfg.aggregate,
-            "positional_encoding": cfg.positional_encoding,
-            "angle_sin_cos": cfg.angle_sin_cos,
             "rollout_steps": cfg.rollout_steps,
         },
     }
@@ -185,7 +184,7 @@ def _save_checkpoint(cfg: GAConfig, generation: int, population: List[ParticleNC
     print(f"[Checkpoint] Saved population to {ckpt_path}")
 
 
-def _load_checkpoint(cfg: GAConfig) -> Tuple[int, List[ParticleNCA], List[float]]:
+def _load_checkpoint(cfg: GAConfig) -> Tuple[int, List[ParticleNCA_edge], List[float]]:
     assert cfg.resume_path is not None
     state = torch.load(cfg.resume_path, map_location="cpu")
     start_gen = int(state.get("generation", 0))
@@ -202,15 +201,12 @@ def _load_checkpoint(cfg: GAConfig) -> Tuple[int, List[ParticleNCA], List[float]
                     pass
     meta = state.get("model_meta", {})
     population_sd = state.get("population", [])
-    population: List[ParticleNCA] = []
+    population: List[ParticleNCA_edge] = []
     for sd in population_sd:
-        m = ParticleNCA(
+        m = ParticleNCA_edge(
             molecule_dim=int(meta.get("molecule_dim", cfg.n_molecules)),
             k=int(meta.get("k", cfg.k)),
             cutoff=float(meta.get("cutoff", cfg.cutoff)),
-            angle_sin_cos=bool(meta.get("angle_sin_cos", cfg.angle_sin_cos)),
-            positional_encoding=bool(meta.get("positional_encoding", cfg.positional_encoding)),
-            aggregate=str(meta.get("aggregate", cfg.aggregate)),
         )
         m.load_state_dict(sd)
         population.append(m)
@@ -218,13 +214,14 @@ def _load_checkpoint(cfg: GAConfig) -> Tuple[int, List[ParticleNCA], List[float]
     return start_gen, population, history
 
     
-
+from target_functions import get_all_cells_to_origin_distance
 # # Select fitness function: 
 def fitness_fn(world, cfg):
     # Rotated target using the per-run global angle
-    # return looks_like_vitruvian_gaussian_rotated(world, cfg, level=0, gauss_width=cfg.cell_size, threshold=0.85, angle_rad=world.global_angle)
-    return color_and_cover(world, cfg, level=0, gauss_width=cfg.cell_size, threshold=0.85, angle_rad=world.global_angle)
-    return looks_like_vitruvian_gaussian_rotated_colored(world, cfg, level=0, gauss_width=cfg.cell_size, threshold=0.85, angle_rad=world.global_angle)
+    # return get_all_cells_to_origin_distance(world, cfg)
+    return looks_like_vitruvian_gaussian_rotated(world, cfg, level=1, gauss_width=cfg.cell_size, threshold=0.85, angle_rad=world.global_angle)
+    # return color_and_cover(world, cfg, level=0, gauss_width=cfg.cell_size, threshold=0.85, angle_rad=world.global_angle)
+    # return looks_like_vitruvian_gaussian_rotated_colored(world, cfg, level=0, gauss_width=cfg.cell_size, threshold=0.85, angle_rad=world.global_angle)
 
 
 
@@ -236,7 +233,7 @@ from target_functions import color_fitness, color_fitness_rotated
 
 def evaluate_model(
     cfg: GAConfig,
-    model: ParticleNCA,
+    model: ParticleNCA_edge,
     N_times: int = 1,
     return_positions: bool = False,
     return_model_states: bool = False,
@@ -256,8 +253,6 @@ def evaluate_model(
     We sample the fitness N_times uniformly across the rollout and average those samples.
     """
     # Choose per-run global angle if not provided
-    if global_angle is None:
-        global_angle = random.uniform(0.0, 2.0 * math.pi)
     world = ParticleWorld(cfg, model, global_angle=global_angle)
     # world.reset(n0=1)
 
@@ -305,40 +300,18 @@ def evaluate_model(
 
     return tuple(ret)
 
-def rollout_states(cfg: GAConfig, model: ParticleNCA, steps: int, interval: int = 1) -> Tuple[List[torch.Tensor], List[float]]:
-    """
-    Rollout the world for `steps`, returning sampled positions and fitness values.
-    - positions: list of torch.Tensors (N_t, 2) sampled every `interval` steps
-    - fitnesses: list of floats aligned with positions list
-    """
-    # Use zero angle for utility rollout sampling
-    world = ParticleWorld(cfg, model, global_angle=0.0)
-    world.reset(n0=64)
-    positions: List[torch.Tensor] = []
-    fitnesses: List[float] = []
-    for t in range(steps):
-        world.step()
-        if (t + 1) % interval == 0:
-            if world.x is not None:
-                positions.append(world.x.detach().clone())
-                fitnesses.append(fitness_fn(world, cfg))
-    return positions, fitnesses
-
-def genetic_train(cfg: GAConfig, use_threads: bool = True, max_workers: Optional[int] = None) -> Tuple[ParticleNCA, List[float]]:
+def genetic_train(cfg: GAConfig, use_threads: bool = True, max_workers: Optional[int] = None, random_start_angle: bool = False) -> Tuple[ParticleNCA_edge, List[float]]:
     # Initialize or resume population
     if cfg.resume_path:
         start_gen, population, history = _load_checkpoint(cfg)
     else:
         start_gen = 0
-        population: List[ParticleNCA] = []
+        population: List[ParticleNCA_edge] = []
         for _ in range(cfg.population_size):
-            m = ParticleNCA(
+            m = ParticleNCA_edge(
                 molecule_dim=cfg.n_molecules,
                 k=cfg.k,
                 cutoff=cfg.cutoff,
-                angle_sin_cos=cfg.angle_sin_cos,
-                positional_encoding=cfg.positional_encoding,
-                aggregate=cfg.aggregate,
             )
             population.append(m)
         history: List[float] = []
@@ -371,8 +344,9 @@ def genetic_train(cfg: GAConfig, use_threads: bool = True, max_workers: Optional
                 ex.shutdown(wait=True)
         else:
             print("[GA] Using sequential evaluation.")
+            ang = random.uniform(0, 2*math.pi) if random_start_angle else 0.0 
             for i, m in enumerate(population):
-                res = evaluate_model(cfg, m, cfg.N_times, global_angle=0.0)
+                res = evaluate_model(cfg, m, cfg.N_times, global_angle=ang)
                 scores[i] = float(res if not isinstance(res, tuple) else res[0])
                 if (i+1) % max(1, len(population)//4) == 0 or (i+1) == len(population):
                     print(f"[GA] Evaluation progress: {i+1}/{len(population)} done")
@@ -386,19 +360,16 @@ def genetic_train(cfg: GAConfig, use_threads: bool = True, max_workers: Optional
 
         # Reproduce
         # Order: elites, 2 random, mutated elites (2 per elite)
-        new_pop: List[ParticleNCA] = elites.copy()
+        new_pop: List[ParticleNCA_edge] = elites.copy()
 
         # Add up to 1 fresh random individuals each generation
         for _ in range(1):
             if len(new_pop) >= cfg.population_size:
                 break
-            m_rand = ParticleNCA(
+            m_rand = ParticleNCA_edge(
                 molecule_dim=cfg.n_molecules,
                 k=cfg.k,
                 cutoff=cfg.cutoff,
-                angle_sin_cos=cfg.angle_sin_cos,
-                positional_encoding=cfg.positional_encoding,
-                aggregate=cfg.aggregate,
             )
             new_pop.append(m_rand)
 

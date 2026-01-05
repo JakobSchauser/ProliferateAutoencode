@@ -424,9 +424,8 @@ def rollout_and_show_video_gaussian(
 
 Gaussian = True
 
-def main():
+def main(name):
     steps = None
-    name = "move_and_color_200"
     max_cells = None
 
     # Provide path to a checkpoint like checkpoints/ga_gen_50.pt
@@ -445,7 +444,9 @@ def main():
     if not Gaussian:
         rollout_and_show_video(model, out_path=out_path, fps=2, s=6, level=0, cfg=vis_cfg)
     else:
-        rollout_and_show_video_gaussian(model, out_path=out_path, fps=2, level=0, grid_res=256, mode="max", cfg=vis_cfg, draw_cutoff = True, angle=0.)
+        rollout_and_show_video_gaussian(model, out_path=out_path, fps=2, level=1, grid_res=256, mode="max", cfg=vis_cfg, draw_cutoff = True, angle= 0.)
 
 if __name__ == "__main__":
-    main()
+    name = "two_test_500"
+
+    main(name)

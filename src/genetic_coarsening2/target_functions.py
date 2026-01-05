@@ -171,7 +171,7 @@ def looks_like_vitruvian_gaussian_rotated(
   separation_shortfall = torch.relu(0.05 - min_dist)  # (N,)
   separation_penalty = separation_shortfall.mean()
 
-  return (float(covered_target) * float(covered_cells) ) - float(separation_penalty)*0.1
+  return (float(covered_target) * float(covered_cells) ) #- float(separation_penalty)*0.1
 
 
 def color_fitness(world, cfg) -> float:
@@ -266,3 +266,15 @@ def color_and_cover(world, cfg, angle_rad: float = 0.0, level: int = 1,
       angle_rad=angle_rad,
   )
   return float(coverage * color)
+
+
+def get_all_cells_to_origin_distance(world, cfg) -> float:
+  """
+  Returns the mean distance of all cells to the origin (0,0).
+  """
+  if world.x is None:
+    return float(1e6)
+  pos = world.x  # (N,2) torch.Tensor
+  dists = torch.norm(pos, dim=1)  # (N,)
+  mean_dist = dists.mean().item()
+  return 1 - float(mean_dist)

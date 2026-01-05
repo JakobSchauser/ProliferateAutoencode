@@ -1,9 +1,12 @@
 import math
 from typing import Optional, Tuple
 
+import numpy as np
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from scipy.spatial import Voronoi
 
 
 class ParticleNCA(nn.Module):
@@ -59,10 +62,12 @@ class ParticleNCA(nn.Module):
 			rel_geom_dim += 4  # simple Fourier features for r
 
 		angle_dim = 2 if self.angle_sin_cos else 1
-		rel_input_dim = rel_geom_dim + angle_dim + molecule_dim
+		rel_input_dim = rel_geom_dim + angle_dim + molecule_dim + molecule_dim  # include mol_i
 
 		self.message_mlp = nn.Sequential(
 			nn.Linear(rel_input_dim, message_hidden),
+			nn.ReLU(inplace=True),
+			nn.Linear(message_hidden, message_hidden),
 			nn.ReLU(inplace=True),
 			nn.Linear(message_hidden, message_hidden),
 			nn.ReLU(inplace=True),
@@ -74,6 +79,10 @@ class ParticleNCA(nn.Module):
 		upd_in = message_hidden + self_feat_dim
 		self.update_mlp = nn.Sequential(
 			nn.Linear(upd_in, update_hidden),
+			nn.ReLU(inplace=True),
+			nn.Linear(update_hidden, update_hidden),
+			nn.ReLU(inplace=True),
+			nn.Linear(update_hidden, update_hidden),
 			nn.ReLU(inplace=True),
 			nn.Linear(update_hidden, update_hidden),
 			nn.ReLU(inplace=True),
@@ -102,17 +111,52 @@ class ParticleNCA(nn.Module):
 		return torch.cat(outs, dim=-1)
 
 	def _hard_cutoff_neighbors(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
-		# Compute all neighbors within cutoff distance (hard cutoff)
-		# Returns edge indices as src (neighbor j) and dst (target i) tensors
+		# Previous k-NN cutoff implementation kept for reference:
 		with torch.no_grad():
-			dist = self._pairwise_dist(x)  # (N,N)
-			# Exclude self by setting large distance on diagonal
+			dist = self._pairwise_dist(x)
 			N = dist.shape[0]
 			dist = dist + torch.eye(N, device=x.device) * 1e6
-			# Get all pairs within cutoff
-			mask = dist <= self.cutoff  # (N, N)
-			# Convert to edge list
-			dst, src = torch.where(mask)  # dst = target nodes, src = neighbor nodes
+			mask = dist <= self.cutoff
+			dst, src = torch.where(mask)
+		return src, dst
+		with torch.no_grad():
+			points = x.detach().cpu().numpy()
+			N = points.shape[0]
+			if N <= 1:
+				return (
+					torch.empty(0, dtype=torch.long, device=x.device),
+					torch.empty(0, dtype=torch.long, device=x.device),
+				)
+			if N < 4:
+				# Fallback to dense distance cutoff when Voronoi cannot be constructed
+				dist = self._pairwise_dist(x)
+				dist = dist + torch.eye(N, device=x.device) * 1e6
+				mask = dist <= self.cutoff
+				dst, src = torch.where(mask)
+				return src, dst
+			vor = Voronoi(points)
+			pairs = vor.ridge_points  # (M,2) unique undirected edges
+			if pairs.size == 0:
+				return (
+					torch.empty(0, dtype=torch.long, device=x.device),
+					torch.empty(0, dtype=torch.long, device=x.device),
+				)
+			# limit neighbors by cutoff to avoid long-range connections
+			vec = points[pairs[:, 0]] - points[pairs[:, 1]]
+			if self.cutoff is not None:
+				mask = (vec ** 2).sum(axis=1) <= float(self.cutoff*10.) ** 2
+				pairs = pairs[mask]
+				vec = vec[mask]
+			if pairs.size == 0:
+				return (
+					torch.empty(0, dtype=torch.long, device=x.device),
+					torch.empty(0, dtype=torch.long, device=x.device),
+				)
+			# add both directions for message passing
+			pairs_bidirectional = np.vstack([pairs, pairs[:, ::-1]])
+			pairs_unique = np.unique(pairs_bidirectional, axis=0)
+			src = torch.from_numpy(pairs_unique[:, 1]).to(x.device, dtype=torch.long)
+			dst = torch.from_numpy(pairs_unique[:, 0]).to(x.device, dtype=torch.long)
 		return src, dst
 	
 	def forward(
@@ -158,7 +202,7 @@ class ParticleNCA(nn.Module):
 			rel_geom = torch.cat([dxdy, r], dim=-1)  # (E,3)
 
 		# Per-edge input to message MLP
-		rel_in = torch.cat([rel_geom, ang_feat, d_mol], dim=-1)  # (E, F)
+		rel_in = torch.cat([rel_geom, ang_feat, d_mol, mol_i], dim=-1)  # (E + molecule_dim + angle_dim + rel_geom_dim)
 
 		msg = self.message_mlp(rel_in)  # (E,H)
 

@@ -194,7 +194,7 @@ def sample_positions_grid_from_image(
 		typ = "black"
 
 	# Base grid resolution; start modestly to avoid zero-cell sizes.
-	base = 16*2*4
+	base = 16*2*2
 	n_side = max(1, int(base * np.sqrt(int(2** max(0, int(corse_graining) - 1)))))
 
 	xs = np.linspace(0, w - 1, num=n_side)
@@ -226,7 +226,8 @@ def sample_positions_from_image(
 	rgb_threshold: float | int = 10,
 	alpha_threshold: float | int = 10,
 	seed: int | None = None,
-) -> np.ndarray:
+	return_types: bool = False,
+) -> np.ndarray | tuple[np.ndarray, np.ndarray]:
 	"""
 	Return sampled positions as a NumPy array of shape (N, 2).
 
@@ -249,16 +250,30 @@ def sample_positions_from_image(
 
 	# "normalize"
 	positions[:,0] -= 450
+<<<<<<< HEAD
 	positions[:,1] -= 150
+=======
+	positions[:,1] -= 225
+>>>>>>> 477d559211630b8ca541f2fd0564659ad4e976a0
 
 	positions = positions / 500.
 
+	if corse_graining == 1:
+		positions[:,0] *= 0.5
+		positions[:,1] *= 1.8
 
+	# target_color = np.where(positions[:,0] > 0., 1., -1.)
+	
+	cxx = positions[:,0]
+	target_color = (cxx - cxx.min())/(cxx.max() - cxx.min())
 	if positions.size == 0:
 		return np.empty((0, 2), dtype=np.int32)
 	if positions.ndim == 1:
 		# Ensure shape (N, 2) even for single point
 		positions = positions.reshape(-1, 2)
+	if return_types:
+		return positions, target_color
+	
 	return positions
 
 
