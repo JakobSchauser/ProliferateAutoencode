@@ -250,11 +250,7 @@ def sample_positions_from_image(
 
 	# "normalize"
 	positions[:,0] -= 450
-<<<<<<< HEAD
 	positions[:,1] -= 150
-=======
-	positions[:,1] -= 225
->>>>>>> 477d559211630b8ca541f2fd0564659ad4e976a0
 
 	positions = positions / 500.
 
