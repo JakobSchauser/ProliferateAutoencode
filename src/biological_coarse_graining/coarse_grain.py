@@ -45,7 +45,6 @@ _DEFAULT_POINTS_MAP = {
 # "grid" lays a roughly uniform grid over the image and keeps points whose
 # grid location falls on valid mask pixels; if not enough points, it fills
 # the remainder randomly from the mask.
-MODE: str = "grid"
 
 
 def _opaque_black_mask(arr: np.ndarray, rgb_threshold: float) -> np.ndarray:
@@ -76,6 +75,23 @@ def _opaque_black_mask(arr: np.ndarray, rgb_threshold: float) -> np.ndarray:
 		return black_mask & opaque_mask
 
 	return black_mask
+
+
+def _opaque_mask(arr: np.ndarray) -> np.ndarray:
+	"""
+	Return a boolean mask of opaque pixels (True = opaque).
+
+	- For arrays with alpha channel (RGBA), uses alpha >= 0.5 for float or >= 128 for int.
+	- For grayscale/RGB images without alpha, all pixels are considered opaque.
+	"""
+	if arr.ndim == 3 and arr.shape[-1] == 4:
+		alpha = arr[..., 3]
+		if np.issubdtype(arr.dtype, np.floating):
+			return alpha >= 0.5
+		else:
+			return alpha >= 128
+	# No alpha channel -> treat all as opaque
+	return np.ones(arr.shape[:2], dtype=bool)
 
 
 def _normalize_thresholds(arr: np.ndarray, rgb_threshold: float | int = 10, alpha_threshold: float | int = 10) -> Tuple[float, float]:
@@ -149,26 +165,6 @@ def _prepare_mask_and_coords(
 		coords_rc = np.argwhere(mask)
 		return arr, mask, coords_rc
 
-
-def sample_positions_random_from_image(
-	image_path: str | Sequence[str],
-	corse_graining: int,
-	*,
-	points_map: dict[int, int] | None = None,
-	rgb_threshold: float | int = 10,
-	alpha_threshold: float | int = 10,
-	seed: int | None = None,
-) -> List[Tuple[int, int]]:
-	arr, mask, coords_rc = _prepare_mask_and_coords(image_path, rgb_threshold, alpha_threshold)
-	if coords_rc.size == 0:
-		return []
-	total = min(count_points_for_corse_graining(corse_graining, points_map), coords_rc.shape[0])
-	rng = np.random.default_rng(seed)
-	idx = rng.choice(coords_rc.shape[0], size=total, replace=False)
-	sampled = coords_rc[idx]
-	return [(int(c), int(r)) for r, c in sampled]
-
-
 def sample_positions_grid_from_image(
 	image_path: str | Sequence[str],
 	corse_graining: int,
@@ -177,11 +173,25 @@ def sample_positions_grid_from_image(
 	rgb_threshold: float | int = 10,
 	alpha_threshold: float | int = 10,
 	seed: int | None = None,
-) -> List[Tuple[int, int]]:
+) -> Tuple[List[Tuple[int, int]], str]:
 	# Grid mode: place a grid and sample points where the grid hits valid mask pixels.
 	# Fineness doubles with each level; we do not enforce an exact count.
-	arr, mask, _ = _prepare_mask_and_coords(image_path, rgb_threshold, alpha_threshold)
+	arr, black_mask, _ = _prepare_mask_and_coords(image_path, rgb_threshold, alpha_threshold)
 	h, w = arr.shape[0], arr.shape[1]
+
+	# Determine whether the foreground of interest is black or white.
+	opq = _opaque_mask(arr)
+	white_mask = opq & (~black_mask)
+
+	# Heuristic: choose the sparser mask as the "foreground" to sample from.
+	black_count = int(black_mask.sum())
+	white_count = int(white_mask.sum())
+	if white_count < black_count:
+		mask = white_mask
+		typ = "white"
+	else:
+		mask = black_mask
+		typ = "black"
 
 	# Base grid resolution; start modestly to avoid zero-cell sizes.
 	base = 16*2*4
@@ -206,7 +216,7 @@ def sample_positions_grid_from_image(
 			seen.add(p)
 			dedup.append(p)
 
-	return dedup
+	return dedup, typ
 
 
 def sample_positions_from_image(
@@ -226,31 +236,20 @@ def sample_positions_from_image(
 
 	image_path = image_paths[corse_graining],
 
-	mode = MODE.lower()
-	if mode == "grid":
-		positions_list = sample_positions_grid_from_image(
-			image_path,
-			corse_graining,
-			points_map=points_map,
-			rgb_threshold=rgb_threshold,
-			alpha_threshold=alpha_threshold,
-			seed=seed,
-		)
-	else:
-		positions_list = sample_positions_random_from_image(
-			image_path,
-			corse_graining,
-			points_map=points_map,
-			rgb_threshold=rgb_threshold,
-			alpha_threshold=alpha_threshold,
-			seed=seed,
-		)
+	positions_list, typ = sample_positions_grid_from_image(
+		image_path,
+		corse_graining,
+		points_map=points_map,
+		rgb_threshold=rgb_threshold,
+		alpha_threshold=alpha_threshold,
+		seed=seed,
+	)
 
 	positions = np.asarray(positions_list, dtype=np.int32)
 
 	# "normalize"
 	positions[:,0] -= 450
-	positions[:,1] -= 200
+	positions[:,1] -= 150
 
 	positions = positions / 500.
 
@@ -265,7 +264,6 @@ def sample_positions_from_image(
 
 __all__ = [
 	"count_points_for_corse_graining",
-	"sample_positions_from_image",
 	"sample_positions_random_from_image",
 	"sample_positions_grid_from_image",
 ]
