@@ -1,20 +1,20 @@
 """
-Utilities for sampling pixel positions from images based on
-black/transparent regions, with a simple coarse graining control.
+Simple utilities for sampling (x, y) positions from RGBA mask images.
 
-This module avoids extra dependencies by using matplotlib + numpy
-to read images and compute masks.
+Assumptions
+- Pixels are either transparent, black, or white.
+- Transparent pixels are ignored.
+- Black pixels map to color -1, white pixels map to color +1.
 """
 
 from __future__ import annotations
 
-from typing import Iterable, List, Sequence, Tuple
+from typing import List, Sequence, Tuple
 
 import numpy as np
 from matplotlib import image as mpimg
-import matplotlib.pyplot as plt
 from pathlib import Path
-import argparse
+import matplotlib.pyplot as plt
 
 levels = [0, 1, 2, 3, 4]
 
@@ -33,250 +33,175 @@ image_paths = [
 
 # Default number of points to return for each coarse-graining level (1-4).
 _DEFAULT_POINTS_MAP = {
-	0: 128,
-	1: 128,
+	0: 128*64,
+	1: 128*64,
 	2: 256,
 	3: 512,
 	4: 1024,
 }
 
-# Sampling mode: "random" (default) or "grid".
-# "random" samples uniformly from valid mask pixels without replacement.
-# "grid" lays a roughly uniform grid over the image and keeps points whose
-# grid location falls on valid mask pixels; if not enough points, it fills
-# the remainder randomly from the mask.
-
-
-def _opaque_black_mask(arr: np.ndarray, rgb_threshold: float) -> np.ndarray:
-	"""
-	Build a boolean mask of pixels that are "black" AND opaque (if an alpha channel exists).
-
-	Supports grayscale (H, W), RGB (H, W, 3), or RGBA (H, W, 4) arrays.
-	Thresholds should be given in the data scale of `arr` (0-1 for float, 0-255 for uint8/uint16).
-	"""
-	if arr.ndim == 2:
-		# Grayscale: black if intensity below threshold.
-		return arr <= rgb_threshold
-
-	if arr.ndim != 3 or arr.shape[-1] not in (3, 4):
-		raise ValueError(f"Unsupported image array shape: {arr.shape}")
-
-	rgb = arr[..., :3]
-	# Define black as any pixel whose max channel is below threshold.
-	black_mask = (rgb.max(axis=-1) <= rgb_threshold)
-
-	if arr.shape[-1] == 4:
-		alpha = arr[..., 3]
-		# Consider pixels opaque if alpha >= 0.5 for float images, or >= 128 for integer images.
-		if np.issubdtype(arr.dtype, np.floating):
-			opaque_mask = alpha >= 0.5
-		else:
-			opaque_mask = alpha >= 128
-		return black_mask & opaque_mask
-
-	return black_mask
-
-
-def _opaque_mask(arr: np.ndarray) -> np.ndarray:
-	"""
-	Return a boolean mask of opaque pixels (True = opaque).
-
-	- For arrays with alpha channel (RGBA), uses alpha >= 0.5 for float or >= 128 for int.
-	- For grayscale/RGB images without alpha, all pixels are considered opaque.
-	"""
-	if arr.ndim == 3 and arr.shape[-1] == 4:
-		alpha = arr[..., 3]
-		if np.issubdtype(arr.dtype, np.floating):
-			return alpha >= 0.5
-		else:
-			return alpha >= 128
-	# No alpha channel -> treat all as opaque
-	return np.ones(arr.shape[:2], dtype=bool)
-
-
-def _normalize_thresholds(arr: np.ndarray, rgb_threshold: float | int = 10, alpha_threshold: float | int = 10) -> Tuple[float, float]:
-	"""
-	Convert thresholds to the dtype/range of the incoming array.
-	For float images (0..1), thresholds are scaled to [0,1]. For integer (e.g., uint8 0..255), keep as-is.
-	"""
+def _to_float01(arr: np.ndarray) -> np.ndarray:
+	"""Convert image array to float32 in [0, 1]."""
+	arr = np.asarray(arr)
 	if np.issubdtype(arr.dtype, np.floating):
-		# Scale typical 0..255 integer thresholds down to 0..1 if the caller provided int-like values.
-		rgb_thr = float(rgb_threshold)
-		alpha_thr = float(alpha_threshold)
-		# If thresholds look like integer ranges, normalize.
-		if rgb_thr > 1.0 or alpha_thr > 1.0:
-			rgb_thr /= 255.0
-			alpha_thr /= 255.0
-		return rgb_thr, alpha_thr
-	else:
-		return float(rgb_threshold), float(alpha_threshold)
+		return arr.astype(np.float32)
+	max_val = float(np.iinfo(arr.dtype).max)
+	return arr.astype(np.float32) / max_val
 
 
 def count_points_for_corse_graining(corse_graining: int, points_map: dict[int, int] | None = None) -> int:
-	"""
-	Return the number of points to sample for a given `corse_graining` level.
-
-	Parameters
-	- corse_graining: int in [1, 5]
-	- points_map: optional override mapping for levels 1..5
-
-	Raises
-	- ValueError if `corse_graining` is outside 1..5 or not in the mapping.
-	"""
+	"""Return the number of points to sample for a given coarse-graining level."""
 	if points_map is None:
 		points_map = _DEFAULT_POINTS_MAP
 	if corse_graining not in points_map:
-		raise ValueError("corse_graining must be an integer in [1, 5]")
+		raise ValueError("corse_graining must be an integer present in points_map")
 	return int(points_map[corse_graining])
 
 
-def _prepare_mask_and_coords(
-	image_path: str | Sequence[str],
-	rgb_threshold: float | int,
-	alpha_threshold: float | int,
-):
-	"""
-	Load one or more images and build a combined opaque-black mask.
-	If multiple images are provided, they must share the same dimensions;
-	masks are OR-combined.
-	Returns the first image array for size reference, the combined mask,
-	and its coordinates.
-	"""
-	if isinstance(image_path, (list, tuple)):
-		paths = list(image_path)
-		if not paths:
-			raise ValueError("image_path list is empty")
-		base_arr = mpimg.imread(paths[0])
-		rgb_thr, _ = _normalize_thresholds(base_arr, rgb_threshold, alpha_threshold)
-		mask = _opaque_black_mask(base_arr, rgb_thr)
-		h, w = base_arr.shape[0], base_arr.shape[1]
-		for p in paths[1:]:
-			arr_i = mpimg.imread(p)
-			if arr_i.shape[0] != h or arr_i.shape[1] != w:
-				raise ValueError("All images must have identical dimensions for mask combination")
-			rgb_thr_i, _ = _normalize_thresholds(arr_i, rgb_threshold, alpha_threshold)
-			mask |= _opaque_black_mask(arr_i, rgb_thr_i)
-		coords_rc = np.argwhere(mask)
-		return base_arr, mask, coords_rc
-	else:
-		arr = mpimg.imread(image_path)
-		rgb_thr, _ = _normalize_thresholds(arr, rgb_threshold, alpha_threshold)
-		mask = _opaque_black_mask(arr, rgb_thr)
-		coords_rc = np.argwhere(mask)
-		return arr, mask, coords_rc
-
-def sample_positions_grid_from_image(
-	image_path: str | Sequence[str],
-	corse_graining: int,
+def _classify_pixels(
+	arr: np.ndarray,
 	*,
-	points_map: dict[int, int] | None = None,
-	rgb_threshold: float | int = 10,
-	alpha_threshold: float | int = 10,
-	seed: int | None = None,
-) -> Tuple[List[Tuple[int, int]], str]:
-	# Grid mode: place a grid and sample points where the grid hits valid mask pixels.
-	# Fineness doubles with each level; we do not enforce an exact count.
-	arr, black_mask, _ = _prepare_mask_and_coords(image_path, rgb_threshold, alpha_threshold)
+	rgb_threshold: float = 0.5,
+	alpha_threshold: float = 0.5,
+) -> tuple[np.ndarray, np.ndarray]:
+	"""
+	Return coordinates (row, col) of opaque pixels and their colors (-1 for black, +1 for white).
+
+	Transparent pixels (alpha < alpha_threshold) are ignored. Black/white is determined using
+	max-channel intensity against `rgb_threshold`.
+	"""
+	if arr.ndim == 2:
+		rgb = np.stack([arr, arr, arr], axis=-1)
+		alpha = np.ones(arr.shape, dtype=arr.dtype)
+	elif arr.ndim == 3 and arr.shape[-1] == 3:
+		rgb = arr
+		alpha = np.ones(arr.shape[:2], dtype=arr.dtype)
+	elif arr.ndim == 3 and arr.shape[-1] == 4:
+		rgb = arr[..., :3]
+		alpha = arr[..., 3]
+	else:
+		raise ValueError(f"Unsupported image array shape: {arr.shape}")
+
+	opaque = alpha >= alpha_threshold
+	luminance = rgb.max(axis=-1)
+	black_mask = (luminance <= rgb_threshold) & opaque
+	white_mask = (luminance > rgb_threshold) & opaque
+
+	coords_black = np.argwhere(black_mask)
+	coords_white = np.argwhere(white_mask)
+	coords = np.concatenate([coords_black, coords_white], axis=0)
+	colors = np.concatenate([
+		np.full(coords_black.shape[0], -1.0, dtype=np.float32),
+		np.full(coords_white.shape[0], 1.0, dtype=np.float32),
+	], axis=0)
+	return coords, colors
+
+
+def _sample_grid(
+	arr: np.ndarray,
+	*,
+	target_count: int,
+	rgb_threshold: float = 0.5,
+	alpha_threshold: float = 0.5,
+) -> tuple[np.ndarray, np.ndarray]:
+	"""Sample approximately `target_count` points on an even grid over the image.
+
+	Keeps only opaque pixels; assigns color -1 (black) or +1 (white) per grid location.
+	Deterministic (no randomness).
+	Returns positions as integer pixel coords in (row, col), and colors.
+	"""
 	h, w = arr.shape[0], arr.shape[1]
 
-	# Determine whether the foreground of interest is black or white.
-	opq = _opaque_mask(arr)
-	white_mask = opq & (~black_mask)
-
-	# Heuristic: choose the sparser mask as the "foreground" to sample from.
-	black_count = int(black_mask.sum())
-	white_count = int(white_mask.sum())
-	if white_count < black_count:
-		mask = white_mask
-		typ = "white"
-	else:
-		mask = black_mask
-		typ = "black"
-
-	# Base grid resolution; start modestly to avoid zero-cell sizes.
-	base = 16*2*2
-	n_side = max(1, int(base * np.sqrt(int(2** max(0, int(corse_graining) - 1)))))
-
-	xs = np.linspace(0, w - 1, num=n_side)
+	# Choose grid resolution so that grid points ~ target_count over full image
+	n_side = max(1, int(np.ceil(np.sqrt(max(1, target_count)))))
 	ys = np.linspace(0, h - 1, num=n_side)
+	xs = np.linspace(0, w - 1, num=n_side)
 
-	points: List[Tuple[int, int]] = []
+	# Prepare channels
+	if arr.ndim == 2:
+		rgb = np.stack([arr, arr, arr], axis=-1)
+		alpha = np.ones(arr.shape, dtype=arr.dtype)
+	elif arr.ndim == 3 and arr.shape[-1] == 3:
+		rgb = arr
+		alpha = np.ones(arr.shape[:2], dtype=arr.dtype)
+	elif arr.ndim == 3 and arr.shape[-1] == 4:
+		rgb = arr[..., :3]
+		alpha = arr[..., 3]
+	else:
+		raise ValueError(f"Unsupported image array shape: {arr.shape}")
+
+	opaque = alpha >= alpha_threshold
+	luminance = rgb.max(axis=-1)
+
+	coords_rc: list[tuple[int, int]] = []
+	colors: list[float] = []
+
 	for y in ys:
 		r = int(round(y))
 		for x in xs:
 			c = int(round(x))
-			if mask[r, c]:
-				points.append((c, r))
+			if not opaque[r, c]:
+				continue
+			col = -1.0 if luminance[r, c] <= rgb_threshold else 1.0
+			coords_rc.append((r, c))
+			colors.append(col)
 
-	# Deduplicate in case rounding collides; preserve order
-	seen = set()
-	dedup: List[Tuple[int, int]] = []
-	for p in points:
-		if p not in seen:
-			seen.add(p)
-			dedup.append(p)
+	if len(coords_rc) == 0:
+		return np.empty((0, 2), dtype=np.int32), np.empty((0,), dtype=np.float32)
 
-	return dedup, typ
+	coords_rc_arr = np.asarray(coords_rc, dtype=np.int32)
+	colors_arr = np.asarray(colors, dtype=np.float32)
+	return coords_rc_arr, colors_arr
 
 
 def sample_positions_from_image(
 	corse_graining: int,
 	*,
 	points_map: dict[int, int] | None = None,
-	rgb_threshold: float | int = 10,
-	alpha_threshold: float | int = 10,
+	rgb_threshold: float = 0.5,
+	alpha_threshold: float = 0.5,
 	seed: int | None = None,
 	return_types: bool = False,
 ) -> np.ndarray | tuple[np.ndarray, np.ndarray]:
 	"""
-	Return sampled positions as a NumPy array of shape (N, 2).
+	Return sampled positions (and optional colors) from an RGBA mask image.
 
-	Dispatches to either grid or random sampling based on the global `MODE`.
-	The returned array has integer dtype and columns ordered as (x, y).
+	- Black pixels -> color -1
+	- White pixels -> color +1
+	- Transparent pixels are ignored
+	- Positions are normalized the same way as the previous implementation
 	"""
+	if corse_graining < 0 or corse_graining >= len(image_paths):
+		raise ValueError(f"corse_graining must be between 0 and {len(image_paths) - 1}")
 
-	image_path = image_paths[corse_graining],
-
-	positions_list, typ = sample_positions_grid_from_image(
-		image_path,
-		corse_graining,
-		points_map=points_map,
+	arr = _to_float01(mpimg.imread(image_paths[corse_graining]))
+	target = count_points_for_corse_graining(corse_graining, points_map)
+	coords_rc, colors = _sample_grid(
+		arr,
+		target_count=target,
 		rgb_threshold=rgb_threshold,
 		alpha_threshold=alpha_threshold,
-		seed=seed,
 	)
 
-	positions = np.asarray(positions_list, dtype=np.int32)
+	if coords_rc.shape[0] == 0:
+		return (np.empty((0, 2), dtype=np.float32), np.empty((0,), dtype=np.float32)) if return_types else np.empty((0, 2), dtype=np.float32)
 
-	# "normalize"
-	positions[:,0] -= 450
-	positions[:,1] -= 150
+	# Convert (row, col) -> (x, y)
+	positions = coords_rc[:, [1, 0]].astype(np.float32)
 
-	positions = positions / 500.
+	# Keep legacy normalization expected by downstream code
+	positions[:, 0] -= 450.0
+	positions[:, 1] -= 150.0
+	positions /= 500.0
 
-	if corse_graining == 1:
-		positions[:,0] *= 0.5
-		positions[:,1] *= 1.8
-
-	# target_color = np.where(positions[:,0] > 0., 1., -1.)
-	
-	cxx = positions[:,0]
-	target_color = (cxx - cxx.min())/(cxx.max() - cxx.min())
-	if positions.size == 0:
-		return np.empty((0, 2), dtype=np.int32)
-	if positions.ndim == 1:
-		# Ensure shape (N, 2) even for single point
-		positions = positions.reshape(-1, 2)
 	if return_types:
-		return positions, target_color
-	
+		return positions, colors.astype(np.float32)
 	return positions
 
 
 __all__ = [
 	"count_points_for_corse_graining",
-	"sample_positions_random_from_image",
-	"sample_positions_grid_from_image",
+	"sample_positions_from_image",
 ]
 
 

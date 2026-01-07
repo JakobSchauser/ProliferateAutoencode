@@ -31,6 +31,7 @@ class GAConfig:
     n_molecules: int = 16
     k: int = 16
     cutoff: float = 0.25
+    n_globals: int = 3
     # Checkpointing
     checkpoint_dir: str = "checkpoints"
     resume_path: Optional[str] = None
@@ -44,6 +45,11 @@ class GAConfig:
     cell_size: float = 0.1
     noise_eta: float = 1e-4 # magnitude of gaussian noise injected into updates
     # Note: global rotation angle is chosen per evaluation run
+    # Division (vector-based) parameters
+    divide_threshold: float = 1.0  # norm threshold to trigger division
+    divide_decay: float = 0.95     # per-step decay of accumulator
+    divide_gain: float = 1.0       # scale for model's divide_vec contribution
+    divide_offset: float = 0.05    # distance to place child along division direction
 
 class ParticleWorld:
     def __init__(self, cfg: GAConfig, model: ParticleNCA_edge, global_angle: float = 0.0):
@@ -54,30 +60,38 @@ class ParticleWorld:
         self.angle = None
         self.mol = None
         self.gen = None
+        self.globals = None
         self.global_angle = float(global_angle)
+        self.t = 0.0
+        self.div_accum = None  # (N,2) division accumulator vector
 
 
-    def add_globals(self):
+    def update_globals(self):
+        
         x,y = np.cos(self.global_angle), np.sin(self.global_angle)
-        self.mol[:, 0] = x  # global angle cos
-        self.mol[:, 1] = y  # global angle sin
+        self.globals[:, 0] = x  # global angle cos
+        self.globals[:, 1] = y  # global angle sin
+        self.globals[:,2] = self.t
         # self.mol[:, 0] = self.x[:, 0] #* 2.0 - 1.0  # normalized x pos
         # self.mol[:, 1] = self.x[:, 1]# * 2.0 - 1.0  # normalized y pos
 
     def add_first_time_globals(self):   
         xx, yy = self.x[:,0], self.x[:,1]
-        self.mol[:, 2] = (xx - xx.min())/(xx.max() - xx.min())  # normalized x pos
-        self.mol[:, 3] = (yy - yy.min())/(yy.max() - yy.min())  # normalized y pos
-        self.add_globals()
+        self.mol[:, 0] = (xx - xx.min())/(xx.max() - xx.min())  # normalized x pos
+        self.mol[:, 1] = (yy - yy.min())/(yy.max() - yy.min())  # normalized y pos
+        self.update_globals()
 
     def reset(self, n0: int = 1):
         self.x = torch.zeros(n0, 2, device=self.device)
-        self.angle = torch.zeros(n0, 1, device=self.device)
-        self.mol = torch.zeros(n0, self.cfg.n_molecules, device=self.device)
+        self.angle = torch.rand(n0, 1, device=self.device) * 2.0 * math.pi * 0.
+        self.mol = torch.randn(n0, self.cfg.n_molecules, device=self.device)*0.1
         self.gen = torch.zeros(n0, 1, device=self.device)
+        self.globals = torch.zeros(n0, self.cfg.n_globals, device=self.device)
+        self.t = 0.0
+        self.div_accum = torch.zeros(n0, 2, device=self.device)
         # Encode per-run global angle as a dedicated molecule channel (index 0)
-        # self.add_globals()
-        self.add_first_time_globals()
+        self.update_globals()
+        # self.add_first_time_globals()
 
 
     def reset_to_positions(self, level : int):
@@ -87,15 +101,17 @@ class ParticleWorld:
         N = pos.shape[0]
         self.x = positions.clone()
         # self.x = positions.to(self.device)
-        self.angle = torch.zeros(N, 1, device=self.device)
-        self.mol = torch.zeros(N, self.cfg.n_molecules, device=self.device)
+        self.angle = torch.rand(N, 1, device=self.device) * 2.0 * math.pi * 0.
+        self.mol = torch.randn(N, self.cfg.n_molecules, device=self.device)*0.1
+        self.globals = torch.zeros(N, self.cfg.n_globals, device=self.device)
         self.gen = torch.zeros(N, 1, device=self.device)
         # Encode per-run global angle as a dedicated molecule channel (index 0)
-        # self.add_globals()
-        self.add_first_time_globals()
+        self.update_globals()
+        self.div_accum = torch.zeros(N, 2, device=self.device)
+        # self.add_first_time_globals()
 
     @torch.no_grad()
-    def _perform_divisions(self, divide_mask: torch.Tensor):
+    def _perform_divisions(self, divide_mask: torch.Tensor, directions: Optional[torch.Tensor] = None):
         if divide_mask.sum() == 0:
             return
         N = self.x.shape[0]
@@ -109,33 +125,102 @@ class ParticleWorld:
         if num_new == 0:
             return
         sel = to_divide_idx[:num_new]
-        jitter_pos = 0.01
-        jitter_ang = 0.01
-        x_child = self.x[sel] + (torch.randn_like(self.x[sel]) * jitter_pos)
+        jitter_pos = 0.02
+        jitter_ang = 0.05
+        jitter_mol = 0.05
+
+        # Determine division direction per selected parent, aligned to sel length
+        if directions is None:
+            base_dir = torch.randn_like(self.x[sel])
+        else:
+            base_dir = directions[:sel.shape[0]]
+            if base_dir.shape[0] < sel.shape[0]:
+                pad = torch.randn(sel.shape[0] - base_dir.shape[0], 2, device=self.device, dtype=self.x.dtype)
+                base_dir = torch.cat([base_dir, pad], dim=0)
+
+        # Normalize directions safely
+        dir_norm = base_dir.norm(dim=-1, keepdim=True)
+        safe_dir = base_dir / (dir_norm.clamp_min(1e-12))
+        # Place child along this direction with small positional jitter
+        offset = safe_dir * float(self.cfg.divide_offset) #+ (torch.randn_like(self.x[sel]) * jitter_pos)
+        x_child = self.x[sel] + offset
         angle_child = self.angle[sel] + (torch.randn_like(self.angle[sel]) * jitter_ang)
-        mol_child = self.mol[sel]
+        mol_child = self.mol[sel] + (torch.randn_like(self.mol[sel]) * jitter_mol)
         self.gen[sel] += 1.0
         gen_child = self.gen[sel].clone()
         self.x = torch.cat([self.x, x_child], dim=0)
         self.angle = torch.cat([self.angle, angle_child], dim=0)
         self.mol = torch.cat([self.mol, mol_child], dim=0)
         self.gen = torch.cat([self.gen, gen_child], dim=0)
+        self.globals = torch.cat([self.globals, self.globals[sel]], dim=0)
+        # Append zeroed accumulators for children and reset parents' accumulators
+        if self.div_accum is None:
+            self.div_accum = torch.zeros(self.x.shape[0], 2, device=self.device)
+        else:
+            self.div_accum[sel] = 0.0
+            self.div_accum = torch.cat([self.div_accum, torch.zeros_like(self.x[sel])], dim=0)
         # Ensure global angle channel remains constant for new cells
-        self.add_globals()
+        # self.update_globals()
         
     def step(self):
-        dxdy, dtheta, dmol, div_logit = self.model(self.x, self.angle, self.mol, self.gen)
+        # Pre-sanitize inputs before model call (minimal, defensive)
+        self.x = torch.nan_to_num(self.x)
+        self.angle = torch.nan_to_num(self.angle)
+        self.mol = torch.nan_to_num(self.mol)
+        self.globals = torch.nan_to_num(self.globals)
+        debug = bool(os.environ.get("DEBUG_NANS"))
+        if debug:
+            for name, t in (('x', self.x), ('angle', self.angle), ('mol', self.mol), ('globals', self.globals)):
+                if not torch.isfinite(t).all():
+                    nf = (~torch.isfinite(t)).sum().item()
+                    print(f"[NaN] input {name} non-finite before model: count={nf}, shape={tuple(t.shape)}")
+        dxdy, dtheta, dmol, divide_vec = self.model(self.x, self.angle, self.mol, self.gen, self.globals)
+        if debug:
+            for name, t in (('dxdy', dxdy), ('dtheta', dtheta), ('dmol', dmol), ('divide_vec', divide_vec)):
+                if not torch.isfinite(t).all():
+                    nf = (~torch.isfinite(t)).sum().item()
+                    print(f"[NaN] model output {name} non-finite: count={nf}, shape={tuple(t.shape)} time={self.t:.3f}")
+        # Guard against NaNs/Inf in model outputs (minimal invasion):
+        dxdy = torch.nan_to_num(dxdy, nan=0.0)
+        dtheta = torch.nan_to_num(dtheta, nan=0.0)
+        dmol = torch.nan_to_num(dmol, nan=0.0)
+        divide_vec = torch.nan_to_num(divide_vec, nan=0.0)
+        
         eta = float(self.cfg.noise_eta)
         dxdy = dxdy + torch.randn_like(dxdy) * eta
         dtheta = dtheta + torch.randn_like(dtheta) * eta
         dmol = dmol + torch.randn_like(dmol) * eta
-        self.x = self.x + dxdy * self.cfg.dt
+        self.x = self.x + dxdy * self.cfg.dt*0.01
         self.angle = self.angle + dtheta * self.cfg.dt
         self.mol = self.mol + dmol * self.cfg.dt
+        if debug:
+            for name, t in (('x', self.x), ('angle', self.angle), ('mol', self.mol)):
+                if not torch.isfinite(t).all():
+                    nf = (~torch.isfinite(t)).sum().item()
+                    print(f"[NaN] state {name} non-finite after update: count={nf}, shape={tuple(t.shape)} time={self.t:.3f}")
+        # Sanitize updated states to prevent propagation of NaNs/Inf
+        self.x = torch.nan_to_num(self.x)
+        self.angle = torch.nan_to_num(self.angle)
+        self.mol = torch.nan_to_num(self.mol)
+        
+        self.mol = torch.clamp(self.mol, -15.0, 15.0)
+
         # Keep global angle molecule channel immutable across steps
-        divide = (torch.sigmoid(div_logit) > 0.5).squeeze(-1)
-        # self._perform_divisions(divide)
-        self.add_globals()
+        self.t += self.cfg.dt*10.
+        # Update division accumulator and trigger directional divisions
+        if self.div_accum is None or self.div_accum.shape[0] != self.x.shape[0]:
+            self.div_accum = torch.zeros(self.x.shape[0], 2, device=self.device)
+        self.div_accum = self.div_accum * float(self.cfg.divide_decay) + divide_vec * (float(self.cfg.divide_gain) * self.cfg.dt)
+        norms = self.div_accum.norm(dim=-1)
+        divide_mask = norms > float(self.cfg.divide_threshold)
+        # Unit directions for dividing parents
+        dirs = torch.where(
+            divide_mask.unsqueeze(-1),
+            self.div_accum / (norms.clamp_min(1e-12).unsqueeze(-1)),
+            torch.zeros_like(self.div_accum)
+        )
+        self._perform_divisions(divide_mask, directions=dirs[divide_mask])
+        self.update_globals()
 
 
 
@@ -144,6 +229,7 @@ def clone_model(model: ParticleNCA_edge) -> ParticleNCA_edge:
         molecule_dim=model.molecule_dim,
         k=model.k,
         cutoff=model.cutoff,
+        n_globals=model.n_globals,
     )
     clone.load_state_dict(model.state_dict())
     return clone
@@ -175,6 +261,7 @@ def _save_checkpoint(cfg: GAConfig, generation: int, population: List[ParticleNC
         "population": [m.state_dict() for m in population],
         "model_meta": {
             "molecule_dim": cfg.n_molecules,
+            "n_globals": cfg.n_globals,
             "k": cfg.k,
             "cutoff": cfg.cutoff,
             "rollout_steps": cfg.rollout_steps,
@@ -205,6 +292,7 @@ def _load_checkpoint(cfg: GAConfig) -> Tuple[int, List[ParticleNCA_edge], List[f
     for sd in population_sd:
         m = ParticleNCA_edge(
             molecule_dim=int(meta.get("molecule_dim", cfg.n_molecules)),
+            n_globals=int(meta.get("n_globals", cfg.n_globals)),
             k=int(meta.get("k", cfg.k)),
             cutoff=float(meta.get("cutoff", cfg.cutoff)),
         )
@@ -214,16 +302,25 @@ def _load_checkpoint(cfg: GAConfig) -> Tuple[int, List[ParticleNCA_edge], List[f
     return start_gen, population, history
 
     
-from target_functions import get_all_cells_to_origin_distance
+from target_functions import get_all_cells_to_origin_distance, uniqueness_of_molecules, uniqueness_of_final_n_molecules
 # # Select fitness function: 
-def fitness_fn(world, cfg):
+
+
+def fitness_fn1(world, cfg):
+    return uniqueness_of_final_n_molecules(world, cfg, -2)
+    return uniqueness_of_molecules(world, cfg)
+    
+
+
+def fitness_fn2(world, cfg):
     # Rotated target using the per-run global angle
     # return get_all_cells_to_origin_distance(world, cfg)
-    return looks_like_vitruvian_gaussian_rotated(world, cfg, level=1, gauss_width=cfg.cell_size, threshold=0.85, angle_rad=world.global_angle)
+    return looks_like_vitruvian_gaussian_rotated(world, cfg, level=0, gauss_width=cfg.cell_size, threshold=0.85, angle_rad=world.global_angle)
     # return color_and_cover(world, cfg, level=0, gauss_width=cfg.cell_size, threshold=0.85, angle_rad=world.global_angle)
     # return looks_like_vitruvian_gaussian_rotated_colored(world, cfg, level=0, gauss_width=cfg.cell_size, threshold=0.85, angle_rad=world.global_angle)
 
-
+def fitness_fn(world, cfg):
+    return (fitness_fn1(world, cfg) + fitness_fn2(world, cfg))*0.5
 
 from target_functions import color_fitness, color_fitness_rotated
 # Select fitness function: 
@@ -254,10 +351,10 @@ def evaluate_model(
     """
     # Choose per-run global angle if not provided
     world = ParticleWorld(cfg, model, global_angle=global_angle)
-    # world.reset(n0=1)
+    world.reset(n0=1)
 
     # positions_from
-    world.reset_to_positions(level = 0)
+    # world.reset_to_positions(level = 0)
 
     record_positions: List[torch.Tensor] = []
     record_states: List = []
@@ -268,11 +365,14 @@ def evaluate_model(
     if n_samples >= cfg.rollout_steps:
         sample_steps = set(range(1, cfg.rollout_steps + 1))
     else:
-        # Use evenly spaced indices in 1..rollout_steps
-        sample_steps = set(
-            max(1, min(cfg.rollout_steps, int(round(s))))
-            for s in torch.linspace(cfg.rollout_steps//2, cfg.rollout_steps, steps=n_samples).tolist()
-        )
+        if n_samples == 1:
+            sample_steps = {cfg.rollout_steps}
+        else:
+            # Use evenly spaced indices in 1..rollout_steps
+            sample_steps = set(
+                max(1, min(cfg.rollout_steps, int(round(s))))
+                for s in torch.linspace((3*cfg.rollout_steps)//4, cfg.rollout_steps, steps=n_samples).tolist()
+            )
 
     total_fitness = 0.0
     for t in range(cfg.rollout_steps):
@@ -310,6 +410,7 @@ def genetic_train(cfg: GAConfig, use_threads: bool = True, max_workers: Optional
         for _ in range(cfg.population_size):
             m = ParticleNCA_edge(
                 molecule_dim=cfg.n_molecules,
+                n_globals=cfg.n_globals,
                 k=cfg.k,
                 cutoff=cfg.cutoff,
             )
@@ -368,6 +469,7 @@ def genetic_train(cfg: GAConfig, use_threads: bool = True, max_workers: Optional
                 break
             m_rand = ParticleNCA_edge(
                 molecule_dim=cfg.n_molecules,
+                n_globals=cfg.n_globals,
                 k=cfg.k,
                 cutoff=cfg.cutoff,
             )

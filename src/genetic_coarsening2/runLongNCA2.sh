@@ -5,7 +5,7 @@
 #SBATCH --error=logs/%x_%j.err         # Error log - change as needed
 #SBATCH --partition=main               # Partition to submit to
 #SBATCH --gres=gpu:1                   # Request GPU - Comment out or delete for no GPU
-#SBATCH --cpus-per-task=64           # CPU cores per task
+#SBATCH --cpus-per-task=1           # CPU cores per task
 #SBATCH --mem=64G                      # RAM for job
 #SBATCH --time=04:00:00                # Time limit hh:mm:ss 
 #SBATCH --mail-type=END,FAIL           # Email notifications

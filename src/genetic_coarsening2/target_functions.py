@@ -8,6 +8,21 @@ import torch
 import matplotlib.image as mpimg
 from biological_coarse_graining.coarse_grain import sample_positions_from_image, image_paths
 
+
+def _debug_check(name: str, t: torch.Tensor):
+  if os.environ.get("DEBUG_NANS"):
+    if isinstance(t, torch.Tensor) and not torch.isfinite(t).all():
+      nf = (~torch.isfinite(t)).sum().item()
+      print(f"[NaN][fitness] {name} non-finite: count={nf}, shape={tuple(t.shape)}")
+
+
+def _safe_div(numer: torch.Tensor, denom: torch.Tensor | float, eps: float = 1e-12) -> torch.Tensor:
+  if not isinstance(denom, torch.Tensor):
+    denom_t = torch.tensor(float(denom), dtype=numer.dtype, device=numer.device)
+  else:
+    denom_t = denom
+  return numer / (denom_t + eps)
+
 def looks_like_vitruvian(world, cfg, level = 1, threshold=0.1):
   if world.x is None:
     assert False, "world.x is None in looks_like_vitruvian"
@@ -23,6 +38,8 @@ def looks_like_vitruvian(world, cfg, level = 1, threshold=0.1):
   pts = torch.tensor(world.x.detach().cpu().numpy(), dtype=torch.float32, device=cfg.device)
 
   dists = torch.cdist(pts, target_pts)  # (Na,Nb)
+  _debug_check("looks_like_vitruvian.dists", dists)
+  dists = torch.nan_to_num(dists)
 
   # Coverage: fraction of target points with any source closer than eps
   target_covered = (dists.min(dim=0).values < threshold).float().mean()#/target_pts.shape[0]  # in [0,1]
@@ -89,8 +106,11 @@ def looks_like_vitruvian_gaussian(world, cfg, level: int = 1, gauss_width: float
     return float(0.0)
 
   d2 = torch.cdist(target_pts, pts) ** 2  # (Nb, Na)
+  _debug_check("looks_like_vitruvian_gaussian.d2", d2)
+  d2 = torch.nan_to_num(d2)
   sigma2 = max(1e-12, float(gauss_width) ** 2)
   gauss = torch.exp(- d2 / (2.0 * sigma2))
+  _debug_check("looks_like_vitruvian_gaussian.gauss", gauss)
   field_max = gauss.max(dim=1).values  # (Nb,)
   covered_target = (field_max >= float(threshold)).float().mean()
 
@@ -152,8 +172,11 @@ def looks_like_vitruvian_gaussian_rotated(
     return float(0.0)
 
   d2 = torch.cdist(target_pts, pts) ** 2  # (Nb, Na)
+  _debug_check("looks_like_vitruvian_gaussian_rotated.d2", d2)
+  d2 = torch.nan_to_num(d2)
   sigma2 = max(1e-12, float(gauss_width) ** 2)
   gauss = torch.exp(- d2 / (2.0 * sigma2))
+  _debug_check("looks_like_vitruvian_gaussian_rotated.gauss", gauss)
   field_max = gauss.max(dim=1).values  # (Nb,)
   covered_target = (field_max >= float(threshold)).float().mean()
 
@@ -165,6 +188,7 @@ def looks_like_vitruvian_gaussian_rotated(
 
   # keep a minimum distance between cells
   closest_dist = torch.cdist(pts, pts)  # (N,N)
+  closest_dist = torch.nan_to_num(closest_dist)
 
   closest_dist = closest_dist + torch.eye(closest_dist.shape[0], device=pts.device) * 1e6
   min_dist = closest_dist.min(dim=1).values  # (N,)
@@ -197,6 +221,8 @@ def color_fitness(world, cfg) -> float:
     return float(0.0)
 
   d2 = torch.cdist(target_pts, pts) ** 2
+  _debug_check("color_fitness.d2", d2)
+  d2 = torch.nan_to_num(d2)
 
   # Color correctness: nearest-cell assignment per target
   nn_idx = d2.argmin(dim=1)
@@ -230,6 +256,8 @@ def color_fitness_rotated(world, cfg, angle_rad: float = 0.0) -> float:
     return float(0.0)
 
   d2 = torch.cdist(target_pts, pts) ** 2
+  _debug_check("color_fitness_rotated.d2", d2)
+  d2 = torch.nan_to_num(d2)
 
   # Color correctness: nearest-cell assignment per target
   nn_idx = d2.argmin(dim=0)
@@ -278,3 +306,95 @@ def get_all_cells_to_origin_distance(world, cfg) -> float:
   dists = torch.norm(pos, dim=1)  # (N,)
   mean_dist = dists.mean().item()
   return 1 - float(mean_dist)
+
+
+def uniqueness_of_molecules(world, cfg) -> float:
+  """
+  Returns a fitness score based on the uniqueness of molecule vectors among cells.
+  Higher score for more unique molecule vectors.
+  """
+  if world.mol is None or world.mol.shape[0] == 0:
+    return float(0.0)
+  
+  mols = world.mol  # (N, C) torch.Tensor
+  N = mols.shape[0]
+  
+  # Compute pairwise distances between molecule vectors
+  dists = torch.cdist(mols, mols)  # (N, N)
+  _debug_check("uniqueness_of_molecules.dists", dists)
+  dists = torch.nan_to_num(dists)
+  
+  
+
+  # Count number of unique molecule vectors based on a distance threshold
+  if N < 2:
+    return float(0.0)
+  threshold = 1.
+  unique_mask = (dists > threshold).float()
+  denom = float(N * (N - 1))
+  score = _safe_div(unique_mask.sum(), denom)
+  _debug_check("uniqueness_of_molecules.score", score)
+  return float(score) # goes from 0 to 1 where 1 is all unique
+
+
+def uniqueness_of_final_n_molecules(world, cfg, n: int = -1) -> float:
+  """
+  Returns a fitness score based on the uniqueness of the nth molecule channels among cells.
+  Higher score for more unique values in the nth molecule channels.
+  """
+  if world.mol is None or world.mol.shape[0] == 0:
+    return float(0.0)
+  
+  mols = world.mol[:, n:]  # (N, n) torch.Tensor
+  N = mols.shape[0]
+  
+  # Compute pairwise distances between nth molecule vectors
+  dists = torch.cdist(mols, mols)  # (N, N)
+  _debug_check("uniqueness_of_final_n_molecules.dists", dists)
+  dists = torch.nan_to_num(dists)
+
+  # only take upper triangle without diagonal
+  dists = dists.triu(diagonal=1)
+ 
+  if N < 2:
+    return float(0.0)
+  N_entries = N * (N - 1) / 2
+  # Count number of unique nth molecule vectors based on a distance threshold
+  threshold = 0.3
+  unique_mask = (dists > threshold).float()
+  score = _safe_div(unique_mask.sum(), float(N_entries))
+  _debug_check("uniqueness_of_final_n_molecules.score", score)
+  return float(score) # goes from 0 to 1 where 1 is all unique
+
+
+def local_agreement_global_uniqueness(world, cfg) -> float:
+  """
+  Returns a fitness score that combines local agreement and global uniqueness of molecule vectors.
+  Higher score for high local agreement and high global uniqueness.
+  """
+  if world.mol is None or world.mol.shape[0] == 0:
+    return float(0.0)
+  
+  mols = world.mol  # (N, C) torch.Tensor
+  N = mols.shape[0]
+  
+  # Compute pairwise distances between molecule vectors
+  moleculardists = torch.cdist(mols, mols)  # (N, N)
+  spatialdists = torch.cdist(world.x, world.x)  # (N, N)
+  moleculardists = torch.nan_to_num(moleculardists)
+  spatialdists = torch.nan_to_num(spatialdists)
+
+  # Local agreement: average distance of molecule vectors for nearby cells
+  local_threshold = 0.1
+  local_mask = (spatialdists < local_threshold).float()
+  local_agreement = (moleculardists * local_mask).sum() / (local_mask.sum() + 1e-6)
+
+  # Global uniqueness: average distance of molecule vectors for all cell pairs
+  if N < 2:
+    return float(0.0)
+  global_uniqueness = _safe_div(moleculardists.sum(), float(N * (N - 1)))
+
+  # Combine local agreement and global uniqueness into a single fitness score
+  fitness = (1.0 / (1.0 + local_agreement)) * global_uniqueness
+  _debug_check("local_agreement_global_uniqueness.fitness", fitness)
+  return float(fitness)

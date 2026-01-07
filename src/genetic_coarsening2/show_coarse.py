@@ -212,6 +212,7 @@ def rollout_and_show_video_gaussian(
     cfg: Optional[GAConfig] = None,
     draw_cutoff: bool = False,
     angle: Optional[float] = None,
+    draw_arrows: bool = False,
 ):
     """
     Render an animation of the Gaussian field induced by particle positions.
@@ -293,9 +294,13 @@ def rollout_and_show_video_gaussian(
     )
     # Overlay scatter of particles colored by selected state channel
     scat = ax.scatter([], [], s=6, alpha=0.8, cmap=cmap, zorder=3)
-    state_vmin = np.min([s[:,state_index].min() for s in states_t])
-    state_vmax = np.max([s[:,state_index].max() for s in states_t])
-    print(f"State[{state_index}] value range over rollout: [{state_vmin:.4f}, {state_vmax:.4f}]")
+    # Initialize color normalization from first frame; will update each frame
+    if isinstance(states_t, (list, tuple)) and len(states_t) > 0:
+        w0 = states_t[0][:, state_index]
+        state_vmin = float(np.min(w0)) if w0.size > 0 else 0.0
+        state_vmax = float(np.max(w0)) if w0.size > 0 else 1.0
+    else:
+        state_vmin, state_vmax = 0.0, 1.0
     norm = Normalize(vmin=state_vmin, vmax=state_vmax)
     scat.set_norm(norm)
     # Optional colorbar for state values (place before animation so it's included)
@@ -307,6 +312,9 @@ def rollout_and_show_video_gaussian(
 
     # Prepare cutoff circles overlay
     cutoff_artist = None
+
+    # Prepare quiver overlay for angles (small arrows at particle positions)
+    quiv = None
 
     # rotate target points for overlay
     from target_functions import rotate_positions
@@ -360,11 +368,19 @@ def rollout_and_show_video_gaussian(
             cutoff_artist.set_animated(True)
             ax.add_collection(cutoff_artist)
             artists.append(cutoff_artist)
+        # Initialize an empty quiver artist
+        nonlocal quiv
+        if draw_arrows:
+            quiv = ax.quiver([], [], [], [], angles='xy', scale_units='xy', scale=1.0, width=0.003, color='cyan', zorder=4)
+            quiv.set_animated(True)
+            artists.append(quiv)
         return tuple(artists)
 
     def update(frame):
         pos = positions[frame] if frame < len(positions) else np.empty((0, 2), dtype=np.float32)
         w = states_t[frame][:,state_index]
+        ang = states_t[frame][:,0]  # angle channel
+
 
         # add fitness to title
         fitness = fitness_history[frame]
@@ -373,14 +389,40 @@ def rollout_and_show_video_gaussian(
         field = compute_field(pos)
         im.set_data(field)
         scat.set_offsets(pos)
-        # Clamp colors to [0,1]
+        # Update colors and per-frame color limits
         scat.set_array(w)
+        if w.size > 0:
+            vmin = float(np.min(w))
+            vmax = float(np.max(w))
+            norm.vmin = vmin
+            norm.vmax = vmax
+            scat.set_norm(norm)
+            if cbar is not None:
+                try:
+                    cbar.update_normal(scat)
+                except Exception:
+                    pass
         # Update cutoff circles if enabled
         artists = []
         if target_artist is None:
             artists = [im, scat]
         else:
             artists = [target_artist, im, scat]
+        nonlocal quiv
+        # Recreate quiver each frame to ensure positions match U,V lengths
+        if draw_arrows:
+            try:
+                if quiv is not None:
+                    quiv.remove()
+            except Exception:
+                pass
+            if pos.shape[0] > 0 and ang.shape[0] == pos.shape[0]:
+                arrow_scale = 0.05
+                u = np.cos(ang) * arrow_scale
+                v = np.sin(ang) * arrow_scale
+                quiv = ax.quiver(pos[:, 0], pos[:, 1], u, v, angles='xy', scale_units='xy', scale=1.0, width=0.003, color='cyan', zorder=4)
+                quiv.set_animated(True)
+                artists.append(quiv)
         if draw_cutoff:
             # Remove previous collection and create a new one for current frame
             nonlocal cutoff_artist
@@ -444,9 +486,9 @@ def main(name):
     if not Gaussian:
         rollout_and_show_video(model, out_path=out_path, fps=2, s=6, level=0, cfg=vis_cfg)
     else:
-        rollout_and_show_video_gaussian(model, out_path=out_path, fps=2, level=1, grid_res=256, mode="max", cfg=vis_cfg, draw_cutoff = True, angle= 0.)
+        rollout_and_show_video_gaussian(model, out_path=out_path, fps=2, level=1, grid_res=256, mode="max", cfg=vis_cfg, draw_cutoff = True, angle= 0., state_index=-1, draw_arrows = False)
 
 if __name__ == "__main__":
-    name = "two_test_500"
+    name = "nine_test_350"
 
     main(name)
