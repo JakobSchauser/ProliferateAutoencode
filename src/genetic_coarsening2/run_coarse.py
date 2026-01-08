@@ -13,7 +13,7 @@ def main():
         rollout_steps=100,
         dt=0.1,
         target_count=128,
-        max_cells=500,
+        max_cells=200,
         device="cpu",
         cutoff=0.04,
         cell_size = 0.05,

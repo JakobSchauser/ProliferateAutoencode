@@ -49,7 +49,7 @@ class GAConfig:
     divide_threshold: float = 1.0  # norm threshold to trigger division
     divide_decay: float = 0.95     # per-step decay of accumulator
     divide_gain: float = 1.0       # scale for model's divide_vec contribution
-    divide_offset: float = 0.05    # distance to place child along division direction
+    divide_offset: float = 0.03    # distance to place child along division direction
 
 class ParticleWorld:
     def __init__(self, cfg: GAConfig, model: ParticleNCA_edge, global_angle: float = 0.0):
@@ -58,6 +58,7 @@ class ParticleWorld:
         self.model = model.to(self.device)
         self.x = None
         self.angle = None
+        self.heading = None
         self.mol = None
         self.gen = None
         self.globals = None
@@ -84,6 +85,8 @@ class ParticleWorld:
     def reset(self, n0: int = 1):
         self.x = torch.zeros(n0, 2, device=self.device)
         self.angle = torch.rand(n0, 1, device=self.device) * 2.0 * math.pi * 0.
+        # Initialize heading from angle (unit length)
+        self.heading = torch.cat([torch.cos(self.angle), torch.sin(self.angle)], dim=-1)
         self.mol = torch.randn(n0, self.cfg.n_molecules, device=self.device)*0.1
         self.gen = torch.zeros(n0, 1, device=self.device)
         self.globals = torch.zeros(n0, self.cfg.n_globals, device=self.device)
@@ -102,6 +105,7 @@ class ParticleWorld:
         self.x = positions.clone()
         # self.x = positions.to(self.device)
         self.angle = torch.rand(N, 1, device=self.device) * 2.0 * math.pi * 0.
+        self.heading = torch.cat([torch.cos(self.angle), torch.sin(self.angle)], dim=-1)
         self.mol = torch.randn(N, self.cfg.n_molecules, device=self.device)*0.1
         self.globals = torch.zeros(N, self.cfg.n_globals, device=self.device)
         self.gen = torch.zeros(N, 1, device=self.device)
@@ -145,11 +149,18 @@ class ParticleWorld:
         offset = safe_dir * float(self.cfg.divide_offset) #+ (torch.randn_like(self.x[sel]) * jitter_pos)
         x_child = self.x[sel] + offset
         angle_child = self.angle[sel] + (torch.randn_like(self.angle[sel]) * jitter_ang)
+        # Child heading inherits with small 2D jitter; clamp to unit length
+        if self.heading is None:
+            self.heading = torch.cat([torch.cos(self.angle), torch.sin(self.angle)], dim=-1)
+        heading_child = self.heading[sel] + (torch.randn_like(self.x[sel]) * jitter_pos)
+        h_norm = heading_child.norm(dim=-1, keepdim=True)
+        heading_child = heading_child / h_norm.clamp_min(1e-12)
         mol_child = self.mol[sel] + (torch.randn_like(self.mol[sel]) * jitter_mol)
         self.gen[sel] += 1.0
         gen_child = self.gen[sel].clone()
         self.x = torch.cat([self.x, x_child], dim=0)
         self.angle = torch.cat([self.angle, angle_child], dim=0)
+        self.heading = torch.cat([self.heading, heading_child], dim=0)
         self.mol = torch.cat([self.mol, mol_child], dim=0)
         self.gen = torch.cat([self.gen, gen_child], dim=0)
         self.globals = torch.cat([self.globals, self.globals[sel]], dim=0)
@@ -166,15 +177,18 @@ class ParticleWorld:
         # Pre-sanitize inputs before model call (minimal, defensive)
         self.x = torch.nan_to_num(self.x)
         self.angle = torch.nan_to_num(self.angle)
+        if self.heading is None:
+            self.heading = torch.cat([torch.cos(self.angle), torch.sin(self.angle)], dim=-1)
+        self.heading = torch.nan_to_num(self.heading)
         self.mol = torch.nan_to_num(self.mol)
         self.globals = torch.nan_to_num(self.globals)
         debug = bool(os.environ.get("DEBUG_NANS"))
         if debug:
-            for name, t in (('x', self.x), ('angle', self.angle), ('mol', self.mol), ('globals', self.globals)):
+            for name, t in (('x', self.x), ('angle', self.angle), ('heading', self.heading), ('mol', self.mol), ('globals', self.globals)):
                 if not torch.isfinite(t).all():
                     nf = (~torch.isfinite(t)).sum().item()
                     print(f"[NaN] input {name} non-finite before model: count={nf}, shape={tuple(t.shape)}")
-        dxdy, dtheta, dmol, divide_vec = self.model(self.x, self.angle, self.mol, self.gen, self.globals)
+        dxdy, dtheta, dmol, divide_vec = self.model(self.x, self.mol, self.gen, self.globals, self.heading)
         if debug:
             for name, t in (('dxdy', dxdy), ('dtheta', dtheta), ('dmol', dmol), ('divide_vec', divide_vec)):
                 if not torch.isfinite(t).all():
@@ -201,6 +215,7 @@ class ParticleWorld:
         # Sanitize updated states to prevent propagation of NaNs/Inf
         self.x = torch.nan_to_num(self.x)
         self.angle = torch.nan_to_num(self.angle)
+        self.heading = torch.nan_to_num(self.heading)
         self.mol = torch.nan_to_num(self.mol)
         
         self.mol = torch.clamp(self.mol, -15.0, 15.0)

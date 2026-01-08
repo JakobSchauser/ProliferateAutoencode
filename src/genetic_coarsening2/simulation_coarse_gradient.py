@@ -36,21 +36,21 @@ class ParticleWorldGrad:
         self.device = torch.device(cfg.device)
         self.model = model.to(self.device)
         self.x = None
-        self.angle = None
         self.mol = None
         self.gen = None
 
     def reset(self, n0: int):
         self.x = torch.zeros(n0, 2, device=self.device)
-        self.angle = torch.zeros(n0, 1, device=self.device)
+        # heading-only model: initialize molecules and generation
         self.mol = torch.zeros(n0, self.cfg.n_molecules, device=self.device)
         self.gen = torch.zeros(n0, 1, device=self.device)
 
     def step(self):
-        dxdy, dtheta, dmol, _ = self.model(self.x, self.angle, self.mol, self.gen)
+        # legacy gradient runner: call updated model signature (no angle)
+        dxdy, dtheta, dmol, _ = self.model(self.x, self.mol, self.gen, torch.zeros(self.x.shape[0], 0, device=self.device), torch.zeros(self.x.shape[0], 2, device=self.device))
         eta = float(self.cfg.noise_eta)
         self.x = self.x + (dxdy + torch.randn_like(dxdy) * eta) * self.cfg.dt
-        self.angle = self.angle + (dtheta + torch.randn_like(dtheta) * eta) * self.cfg.dt
+        # dtheta currently unused in heading-only pipeline
         self.mol = self.mol + (dmol + torch.randn_like(dmol) * eta) * self.cfg.dt
         self.gen = self.gen + 1.0
 

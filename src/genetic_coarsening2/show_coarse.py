@@ -486,9 +486,9 @@ def main(name):
     if not Gaussian:
         rollout_and_show_video(model, out_path=out_path, fps=2, s=6, level=0, cfg=vis_cfg)
     else:
-        rollout_and_show_video_gaussian(model, out_path=out_path, fps=2, level=1, grid_res=256, mode="max", cfg=vis_cfg, draw_cutoff = True, angle= 0., state_index=-1, draw_arrows = False)
+        rollout_and_show_video_gaussian(model, out_path=out_path, fps=2, level=0, grid_res=256, mode="max", cfg=vis_cfg, draw_cutoff = True, angle= 0., state_index=-1, draw_arrows = False)
 
 if __name__ == "__main__":
-    name = "nine_test_350"
+    name = "ten_test_50"
 
     main(name)
