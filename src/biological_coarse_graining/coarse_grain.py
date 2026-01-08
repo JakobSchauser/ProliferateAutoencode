@@ -190,8 +190,8 @@ def sample_positions_from_image(
 	positions = coords_rc[:, [1, 0]].astype(np.float32)
 
 	# Keep legacy normalization expected by downstream code
-	positions[:, 0] -= 450.0
-	positions[:, 1] -= 150.0
+	positions[:, 0] -= 450.0  
+	positions[:, 1] -= 225.0 # uesd to be 150.0
 	positions /= 500.0
 
 	if return_types:

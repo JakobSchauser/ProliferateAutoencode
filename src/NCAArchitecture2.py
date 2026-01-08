@@ -15,22 +15,26 @@ class ParticleNCA_edge(nn.Module):
 
 	Each particle (cell) has features:
 	  - x, y: position
-	  - angle: orientation in radians
+	  - heading: 2D orientation vector (len <= 1)
 	  - molecules: hidden channels of size `molecule_dim`
 
 	Neighborhood: k-NN with cutoff radius. Messages are computed using
-	relative features (dx, dy, d_angle, neighbor molecules - self molecules).
+	relative features (dx, dy, heading delta features, neighbor molecules - self molecules).
 
 	The model predicts deltas for updates:
 	  (dx, dy, d_angle, d_molecules)
 
+	Notes:
+	- Heading is required and used for body-frame projections and directional gating.
+
 	Usage:
 	  nca = ParticleNCA(molecule_dim=16, k=16, cutoff=0.25)
 	  x = torch.randn(N, 2)             # positions
-	  angle = torch.randn(N, 1)         # angles (radians)
 	  mol = torch.randn(N, 16)          # molecules
 	  gen = torch.zeros(N, 1)           # generation number (int-like float)
-	  dx, dtheta, dmol, divide_logit = nca(x, angle, mol, gen)
+	  heading = torch.randn(N, 2)
+	  heading = heading / (heading.norm(dim=-1, keepdim=True) + 1e-12)
+	  dx, dtheta, dmol, divide_logit = nca(x, mol, gen, globals, heading)
 	"""
 
 	def __init__(
@@ -70,12 +74,8 @@ class ParticleNCA_edge(nn.Module):
 			nn.ReLU(inplace=True),
 		)
 
-		# Project molecules to a 2D directional preference (destination-local)
-		# Used as a concise scalar gate based on alignment with neighbor direction
-		self.dir_proj = nn.Linear(molecule_dim, 2, bias=False)
-
 		# Node feature dimensionality (used as node input to attention conv)
-		# Components: sin(angle), cos(angle), molecules, generation, degree (n-connections)
+		# Components: heading(x,y), molecules, generation, degree (n-connections), globals
 		self.self_feat_dim = 2 + molecule_dim + 1 + 1 + n_globals
 		# Edge attributes passed into attention conv: encoded edge + self (dst) features
 		edge_attr_dim = message_hidden + self.self_feat_dim
@@ -131,10 +131,10 @@ class ParticleNCA_edge(nn.Module):
 	def forward(
 		self,
 		x: torch.Tensor,           # (N, 2)
-		angle: torch.Tensor,       # (N, 1)
 		molecules: torch.Tensor,   # (N, molecule_dim)
 		generation: torch.Tensor,  # (N, 1) integer-like counter
 		globals : torch.Tensor,    # (N, globals)
+		heading: torch.Tensor,     # (N,2) heading; required
 	) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
 		N = x.shape[0]
 
@@ -148,8 +148,10 @@ class ParticleNCA_edge(nn.Module):
 		# Gather features per edge
 		x_i = x[dst]        # (E,2)
 		x_j = x[src]        # (E,2)
-		angle_i = angle[dst]  # (E,1)
-		angle_j = angle[src]  # (E,1)
+		# Use provided heading (can be non-unit; assumed len <= 1)
+		heading_full = heading
+		h_i = heading_full[dst]  # (E,2)
+		h_j = heading_full[src]  # (E,2)
 		mol_i = molecules[dst]  # (E,C)
 		mol_j = molecules[src]  # (E,C)
 		globals_i = globals[dst]  # (E, G)
@@ -158,8 +160,15 @@ class ParticleNCA_edge(nn.Module):
 		# Relative features per edge
 		dxdy = x_j - x_i                # (E,2)
 		r = torch.sqrt(torch.clamp((dxdy ** 2).sum(-1, keepdim=True), min=1e-7))  # (E,1)
-		d_angle = angle_j - angle_i     # (E,1)
-		ang_feat = torch.cat([torch.sin(d_angle), torch.cos(d_angle)], dim=-1)  # (E,2)
+		# Normalize headings for angular features and body-frame
+		h_norm_i = h_i.norm(dim=-1, keepdim=True)
+		h_norm_j = h_j.norm(dim=-1, keepdim=True)
+		h_hat_i = h_i / (h_norm_i + 1e-12)
+		h_hat_j = h_j / (h_norm_j + 1e-12)
+		# Vector equivalents of angle delta features
+		cos_d = (h_hat_i * h_hat_j).sum(dim=-1, keepdim=True)  # (E,1)
+		sin_d = h_hat_i[:, 0:1] * h_hat_j[:, 1:2] - h_hat_i[:, 1:2] * h_hat_j[:, 0:1]  # (E,1)
+		ang_feat = torch.cat([sin_d, cos_d], dim=-1)  # (E,2)
 		d_mol = mol_j - mol_i           # (E,C)
 
 		debug = bool(os.environ.get("DEBUG_NANS"))
@@ -170,8 +179,8 @@ class ParticleNCA_edge(nn.Module):
 				print(f"[NaN] r non-finite: count={bad}, shape={tuple(r.shape)}")
 
 		# Body-frame projections relative to the destination node's angle
-		u_i = torch.cat([torch.cos(angle_i), torch.sin(angle_i)], dim=-1)  # (E,2)
-		v_i = torch.cat([-torch.sin(angle_i), torch.cos(angle_i)], dim=-1)  # (E,2)
+		u_i = h_hat_i  # (E,2)
+		v_i = torch.stack([-u_i[:, 1], u_i[:, 0]], dim=-1)  # (E,2) perpendicular to heading
 		fwd = (dxdy * u_i).sum(dim=-1, keepdim=True)  # (E,1)
 		lat = (dxdy * v_i).sum(dim=-1, keepdim=True)  # (E,1)
 
@@ -195,26 +204,22 @@ class ParticleNCA_edge(nn.Module):
 			print(f"[NaN] msg non-finite: count={nf}, shape={tuple(msg.shape)}")
 		msg = torch.nan_to_num(msg)
 
-		# Concise molecular directional weighting:
-		# Map destination molecules to a 2D preference, compare with edge direction,
-		# and gate the message magnitude accordingly.
+		# Heading-based directional weighting (magnitude modulates strength)
 		dxdy_hat = dxdy / (r + 1e-12)  # (E,2)
-		pref_i = self.dir_proj(mol_i)  # (E,2)
-		pref_i = pref_i / (pref_i.norm(dim=-1, keepdim=True) + 1e-12)
-		dir_weight = (dxdy_hat * pref_i).sum(dim=-1, keepdim=True)  # [-1,1]
-		gate = 0.5 * (dir_weight + 1.0)  # [0,1]
+		m_mag = torch.clamp(h_norm_i, min=0.0, max=1.0)  # assume len <= 1; bound defensively
+		dir_weight = (dxdy_hat * h_hat_i).sum(dim=-1, keepdim=True)  # [-1,1]
+		gate = 0.5 * (m_mag * dir_weight + 1.0)  # [0,1]
 		if debug:
-			if not torch.isfinite(pref_i).all():
-				print("[NaN] pref_i non-finite")
 			if not torch.isfinite(gate).all():
 				print("[NaN] gate non-finite")
 		msg = gate * msg
 
 		# Self features for update head
-		self_ang = torch.cat([torch.sin(angle), torch.cos(angle)], dim=-1)  # (N,2)
+		# Use provided heading for self features
+		self_heading = heading
 		# Degree encodes the number of neighbors (n-connections) for each node
 		degree = torch.bincount(dst, minlength=N).float().unsqueeze(-1)
-		self_feat = torch.cat([self_ang, molecules, generation, degree, globals], dim=-1)  # (N, 2 + C + 1 + 1 + G)
+		self_feat = torch.cat([self_heading, molecules, generation, degree, globals], dim=-1)  # (N, 2 + C + 1 + 1 + G)
 		if debug and not torch.isfinite(self_feat).all():
 			print("[NaN] self_feat non-finite")
 		self_feat = torch.nan_to_num(self_feat)
@@ -249,12 +254,13 @@ def _quick_test():
 	N = 128
 	C = 16
 	x = torch.rand(N, 2)
-	angle = torch.rand(N, 1) * (2 * math.pi) - math.pi
 	mol = torch.randn(N, C)
 	nca = ParticleNCA_edge(molecule_dim=C, n_globals=0, k=16, cutoff=0.2)
 	gen = torch.zeros(N, 1)
 	globals = torch.zeros(N, 0)
-	dxdy, dtheta, dmol, div_vec = nca(x, angle, mol, gen, globals)
+	heading = torch.randn(N, 2)
+	heading = heading / (heading.norm(dim=-1, keepdim=True) + 1e-12)
+	dxdy, dtheta, dmol, div_vec = nca(x, mol, gen, globals, heading)
 	assert dxdy.shape == (N, 2)
 	assert dtheta.shape == (N, 1)
 	assert dmol.shape == (N, C)
