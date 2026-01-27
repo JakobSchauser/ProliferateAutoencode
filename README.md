@@ -81,3 +81,4 @@ inverse regularization - promote state-diversity
 predict dS
 give global position/give rotation as parameter
 
+GRN learning
